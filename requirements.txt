@@ -1,0 +1,9 @@
+# YouTube scraping - using yt-dlp (most reliable)
+yt-dlp>=2024.1.0
+
+# Data processing
+pandas>=2.3.3
+numpy>=2.4.0
+
+# Date parsing (if needed for timestamp processing)
+dateparser>=1.2.2
