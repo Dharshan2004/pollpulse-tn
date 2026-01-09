@@ -1,9 +1,17 @@
-# YouTube scraping - using yt-dlp (most reliable)
+# YouTube scraping - using yt-dlp
 yt-dlp>=2024.1.0
+
+# Supabase integration
+supabase>=2.0.0
+python-dotenv>=1.0.0
+
+# Machine Learning
+transformers>=4.30.0
+torch>=2.0.0
 
 # Data processing
 pandas>=2.3.3
 numpy>=2.4.0
 
-# Date parsing (if needed for timestamp processing)
+# Date parsing
 dateparser>=1.2.2
