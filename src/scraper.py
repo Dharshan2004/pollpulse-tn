@@ -20,26 +20,87 @@ import time
 from typing import List, Dict, Optional
 from datetime import datetime
 import yt_dlp
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
+from dotenv import load_dotenv
 
 from infra.data_manager import DataSystem
 from discover import discover_videos
 
+# Load environment variables
+load_dotenv()
 
-MAX_COMMENTS_PER_VIDEO = 50
+# Get max comments per video from environment variable
+MAX_COMMENTS_PER_VIDEO = int(os.getenv('MAX_COMMENTS_PER_VIDEO', '50'))
 
 
-def scrape_comments_from_video(video_url: str, max_comments: int = 50) -> List[Dict]:
+def get_transcript_text(video_id: str) -> Optional[str]:
     """
-    Extract comments from a YouTube video using yt-dlp.
+    Fetch video transcript/subtitles with language fallback.
+    
+    Prioritizes Tamil ('ta') manual subtitles, falls back to English ('en').
+    Returns None gracefully if no transcript is available.
+    
+    Args:
+        video_id: YouTube video ID
+    
+    Returns:
+        Concatenated transcript text as a single string, or None if unavailable
+    """
+    try:
+        # Get list of available transcripts
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        
+        # Priority order: Tamil manual > English manual > Tamil auto > English auto
+        language_priority = [
+            ('ta', True),   # Tamil manual
+            ('en', True),   # English manual
+            ('ta', False),  # Tamil auto-generated
+            ('en', False)   # English auto-generated
+        ]
+        
+        for lang_code, prefer_manual in language_priority:
+            try:
+                if prefer_manual:
+                    # Try manual transcript first
+                    transcript = transcript_list.find_manually_created_transcript([lang_code])
+                else:
+                    # Try auto-generated transcript
+                    transcript = transcript_list.find_generated_transcript([lang_code])
+                
+                # Fetch and concatenate transcript
+                transcript_data = transcript.fetch()
+                transcript_text = ' '.join([entry['text'] for entry in transcript_data])
+                return transcript_text
+                
+            except (NoTranscriptFound, TranscriptsDisabled):
+                # Try next language/type
+                continue
+        
+        # No transcript found in any language/type
+        return None
+    
+    except (VideoUnavailable, TranscriptsDisabled, NoTranscriptFound):
+        # Video unavailable or transcripts disabled - return None gracefully
+        return None
+    except Exception:
+        # Any other error - return None gracefully (don't crash)
+        return None
+
+
+def scrape_comments_from_video(video_url: str, max_comments: int = 50) -> tuple:
+    """
+    Extract comments and description from a YouTube video using yt-dlp.
     
     Args:
         video_url: YouTube video URL
         max_comments: Maximum number of comments to extract
     
     Returns:
-        List of comment dictionaries
+        Tuple of (list of comment dictionaries, video description)
     """
     comments = []
+    description = ""
     
     try:
         ydl_opts = {
@@ -53,6 +114,9 @@ def scrape_comments_from_video(video_url: str, max_comments: int = 50) -> List[D
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=False)
+            
+            # Extract description
+            description = info.get('description', '') or ''
             
             # Extract comments from info dict
             comment_data = info.get('comments', [])
@@ -69,7 +133,7 @@ def scrape_comments_from_video(video_url: str, max_comments: int = 50) -> List[D
     except Exception as e:
         print(f"Error extracting comments: {str(e)[:150]}")
     
-    return comments
+    return comments, description
 
 
 def scrape_comments(video_list: Optional[List[Dict]] = None):
@@ -119,23 +183,36 @@ def scrape_comments(video_list: Optional[List[Dict]] = None):
         print(f"  Video ID: {video_id}")
         
         try:
-            # Scrape comments
-            comments = scrape_comments_from_video(video_url, MAX_COMMENTS_PER_VIDEO)
+            # Fetch transcript (many videos don't have transcripts - this is expected)
+            transcript_text = get_transcript_text(video_id)
+            if transcript_text:
+                print(f"  Transcript found ({len(transcript_text)} characters)")
+            else:
+                print(f"  No transcript available (skipping)")
+            
+            # Scrape comments and description
+            comments, description = scrape_comments_from_video(video_url, MAX_COMMENTS_PER_VIDEO)
             
             if not comments:
-                print(f"  No comments extracted")
+                print(f"    No comments extracted")
                 continue
             
-            # Structure the data
+            # Structure the data with Weighted Hybrid model
+            # YouTube comments are user_comments (weight 1.0) vs authoritative_content (weight 3.0)
             structured_data = {
-                "video_id": video_id,
-                "video_title": video_title,
-                "video_url": video_url,
-                "alliance": video.get('alliance', 'Unknown'),
-                "search_query": video.get('search_query', ''),
-                "channel": video.get('channel', 'Unknown'),
-                "scraped_at": datetime.now().isoformat(),
-                "comments": comments
+                "meta": {
+                    "id": video_id,
+                    "title": video_title,
+                    "description": description,
+                    "url": video_url,
+                    "alliance": video.get('alliance', 'Unknown'),
+                    "search_query": video.get('search_query', ''),
+                    "channel": video.get('channel', 'Unknown'),
+                    "scraped_at": datetime.now().isoformat()
+                },
+                "transcript": transcript_text or "",
+                "authoritative_content": [],  # Empty for YouTube sources (noisy signal)
+                "user_comments": comments  # Low weight (1.0) - user sentiment
             }
             
             # Prepare metadata for job queue
@@ -146,7 +223,9 @@ def scrape_comments(video_list: Optional[List[Dict]] = None):
                 "alliance": video.get('alliance', 'Unknown'),
                 "search_query": video.get('search_query', ''),
                 "channel": video.get('channel', 'Unknown'),
-                "comment_count": len(comments)
+                "comment_count": len(comments),
+                "has_transcript": bool(transcript_text),
+                "transcript_length": len(transcript_text) if transcript_text else 0
             }
             
             # Save to Supabase via DataSystem (Producer pattern)
@@ -160,10 +239,10 @@ def scrape_comments(video_list: Optional[List[Dict]] = None):
             )
             
             if job_id:
-                print(f"  Extracted {len(comments)} comments")
+                print(f"  Extracted {len(comments)} user comments" + (f" and transcript ({len(transcript_text)} chars)" if transcript_text else " (no transcript)"))
                 print(f"  Job {job_id} created in queue")
             else:
-                print(f"  Extracted {len(comments)} comments (failed to save)")
+                print(f"  Extracted {len(comments)} user comments" + (f" and transcript" if transcript_text else "") + " (failed to save)")
         
         except Exception as e:
             print(f"  Error processing video: {str(e)[:100]}")

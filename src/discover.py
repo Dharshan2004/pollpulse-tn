@@ -10,7 +10,11 @@ import json
 import os
 import datetime
 import yt_dlp
-from typing import List, Dict
+from typing import List, Dict, Optional
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 
 CONFIG_PATH = os.path.join("config", "alliances.json")
@@ -77,29 +81,38 @@ def search_youtube_videos(query: str, max_results: int = 5) -> List[Dict]:
     return videos
 
 
-def discover_videos() -> List[Dict]:
+def discover_videos(max_videos_per_query: Optional[int] = None) -> List[Dict]:
     """
     Main discovery function that searches for videos based on alliance keywords.
     
-    Searches YouTube for 3-5 recent videos per keyword category,
+    Searches YouTube for videos per keyword category (configurable via env var),
     deduplicates by video ID, and returns the video list.
+    
+    Args:
+        max_videos_per_query: Maximum videos to fetch per query. If None, reads
+                             from MAX_VIDEOS_PER_QUERY env var (default: 5)
     
     Returns:
         List of video dictionaries with keys: id, url, title, channel, 
         alliance, search_query, status
     """
+    # Get max videos per query from parameter or environment variable
+    if max_videos_per_query is None:
+        max_videos_per_query = int(os.getenv('MAX_VIDEOS_PER_QUERY', '5'))
+    
     queries = load_keywords()
     video_list = []
     seen_ids = set()
     
     print(f"Starting Discovery for {datetime.date.today()}")
-    print(f"Total queries to process: {len(queries)}\n")
+    print(f"Total queries to process: {len(queries)}")
+    print(f"Max videos per query: {max_videos_per_query}\n")
     
     for alliance, query in queries:
         print(f"Searching [{alliance}]: {query}...")
         
         try:
-            videos = search_youtube_videos(query, max_results=5)
+            videos = search_youtube_videos(query, max_results=max_videos_per_query)
             
             for video in videos:
                 vid_id = video['id']

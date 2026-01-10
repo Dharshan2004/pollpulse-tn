@@ -1,0 +1,526 @@
+"""
+Sentiment Analysis Processor - Consumer Component.
+
+This module implements the Consumer pattern in the decoupled ETL architecture.
+It polls the job_queue table for PENDING jobs, downloads the raw JSON data
+from Supabase Storage, runs sentiment analysis using HuggingFace, and updates
+the job status to DONE.
+
+The Consumer operates independently from the Producer (scraper.py):
+1. Polls job_queue for PENDING jobs
+2. Downloads data from Storage
+3. Runs ML inference
+4. Updates job status
+
+This decoupling allows multiple consumers to process jobs in parallel,
+and the Producer can continue scraping without waiting for processing.
+"""
+
+import json
+import os
+import time
+from typing import Optional, Dict, List
+from transformers import pipeline, AutoModelForSequenceClassification, XLMRobertaTokenizer
+
+from infra.client import get_supabase_client
+from infra.data_manager import DataSystem
+
+
+# Load gazetteer (districts data)
+GAZETTEER_PATH = os.path.join("config", "districts.json")
+GAZETTEER = {}
+
+
+def load_gazetteer() -> Dict:
+    """
+    Load the districts gazetteer from config/districts.json.
+    
+    Returns:
+        Dictionary mapping district names to their keywords and constituencies
+    """
+    global GAZETTEER
+    if GAZETTEER:
+        return GAZETTEER
+    
+    try:
+        with open(GAZETTEER_PATH, 'r', encoding='utf-8') as f:
+            GAZETTEER = json.load(f)
+        print(f"Loaded gazetteer with {len(GAZETTEER)} districts")
+        return GAZETTEER
+    except Exception as e:
+        print(f"Error loading gazetteer: {e}")
+        return {}
+
+
+def detect_location(data: Dict) -> List[str]:
+    """
+    Detect location(s) from video data using Metadata-First strategy.
+    
+    Priority order:
+    0. location_override (from news scraper - 100% confidence)
+    1. Metadata (title + description) - High Confidence
+    2. Transcript (if available)
+    3. Comments (require 3+ mentions per district) - Crowdsourcing
+    
+    Args:
+        data: Full JSON payload containing meta, transcript, and comments
+    
+    Returns:
+        List of district names, or ["State_Wide"] if no match found
+    """
+    # Priority 0: Check for location_override (from news scraper - highest confidence)
+    location_override = data.get('location_override')
+    if location_override:
+        print(f"  Location from override (news scraper): {location_override}")
+        return [location_override] if isinstance(location_override, str) else location_override
+    
+    gazetteer = load_gazetteer()
+    if not gazetteer:
+        return ["State_Wide"]
+    
+    detected_districts = set()
+    
+    # Priority 1: Metadata (title + description)
+    meta = data.get('meta', {})
+    title = meta.get('title', '') or ''
+    description = meta.get('description', '') or ''
+    metadata_text = f"{title} {description}".lower()
+    
+    for district_name, district_data in gazetteer.items():
+        keywords = district_data.get('keywords', [])
+        for keyword in keywords:
+            if keyword.lower() in metadata_text:
+                detected_districts.add(district_name)
+                break  # Found match, move to next district
+    
+    if detected_districts:
+        print(f"  Location detected from metadata: {sorted(detected_districts)}")
+        return sorted(list(detected_districts))
+    
+    # Priority 2: Transcript
+    transcript = data.get('transcript', '') or ''
+    if transcript:
+        transcript_lower = transcript.lower()
+        for district_name, district_data in gazetteer.items():
+            keywords = district_data.get('keywords', [])
+            for keyword in keywords:
+                if keyword.lower() in transcript_lower:
+                    detected_districts.add(district_name)
+                    break
+    
+    if detected_districts:
+        print(f"  Location detected from transcript: {sorted(detected_districts)}")
+        return sorted(list(detected_districts))
+    
+    # Priority 3: Comments (require 3+ mentions per district)
+    # Check both new field (user_comments) and old field (comments) for backward compatibility
+    comments = data.get('user_comments', []) or data.get('comments', [])
+    if comments:
+        district_mentions = {}
+        
+        for comment in comments:
+            # Handle both formats: dict (YouTube) and string (news scraper)
+            if isinstance(comment, dict):
+                comment_text = (comment.get('text', '') or '').lower()
+            elif isinstance(comment, str):
+                comment_text = comment.lower()
+            else:
+                continue
+            
+            if not comment_text:
+                continue
+            
+            for district_name, district_data in gazetteer.items():
+                keywords = district_data.get('keywords', [])
+                for keyword in keywords:
+                    if keyword.lower() in comment_text:
+                        district_mentions[district_name] = district_mentions.get(district_name, 0) + 1
+                        break  # Count once per comment per district
+        
+        # Only include districts mentioned in 3+ different comments
+        for district_name, mention_count in district_mentions.items():
+            if mention_count >= 3:
+                detected_districts.add(district_name)
+    
+    if detected_districts:
+        print(f"  Location detected from comments (3+ mentions): {sorted(detected_districts)}")
+        return sorted(list(detected_districts))
+    
+    # Fallback: State-wide
+    print(f"  No location detected, defaulting to State_Wide")
+    return ["State_Wide"]
+
+
+def load_sentiment_model():
+    """
+    Initialize the HuggingFace sentiment analysis pipeline.
+    
+    Returns:
+        Pipeline object for sentiment analysis
+    """
+    try:
+        print("Loading sentiment model (this may take a moment on first run)...")
+        print("Model: cardiffnlp/twitter-xlm-roberta-base-sentiment")
+        
+        # Set cache directory if not already set
+        if not os.getenv('HF_HOME') and not os.getenv('TRANSFORMERS_CACHE'):
+            cache_dir = os.path.join(os.path.expanduser('~'), '.cache', 'huggingface')
+            os.makedirs(cache_dir, exist_ok=True)
+        
+        model_name = "cardiffnlp/twitter-xlm-roberta-base-sentiment"
+        
+        # Use slow tokenizer class directly to avoid fast tokenizer conversion bug
+        print("Loading tokenizer...")
+        tokenizer = XLMRobertaTokenizer.from_pretrained(model_name)
+        
+        # Load model
+        print("Loading model...")
+        model_obj = AutoModelForSequenceClassification.from_pretrained(model_name)
+        
+        # Create pipeline with explicit tokenizer
+        print("Creating pipeline...")
+        model = pipeline(
+            "sentiment-analysis",
+            model=model_obj,
+            tokenizer=tokenizer,
+            return_all_scores=True,
+            device=-1  # Use CPU (set to 0 for GPU if available)
+        )
+        print("Model loaded successfully!")
+        return model
+    except Exception as e:
+        import traceback
+        print(f"Error loading sentiment model: {e}")
+        print(f"Error type: {type(e).__name__}")
+        print("Full traceback:")
+        traceback.print_exc()
+        print("\nTroubleshooting:")
+        print("1. Ensure protobuf is installed: pip install protobuf")
+        print("2. Check internet connection (model needs to download on first run)")
+        print("3. Try clearing cache: rm -rf ~/.cache/huggingface")
+        return None
+
+
+def analyze_sentiment(texts: list, model) -> Dict:
+    """
+    Run sentiment analysis on a list of texts (comments or headlines).
+    
+    Args:
+        texts: List of text items (can be dict with 'text' key or plain strings)
+        model: HuggingFace pipeline model
+    
+    Returns:
+        Dictionary with sentiment statistics (raw counts)
+    """
+    if not model:
+        return {"error": "Model not available"}
+    
+    sentiments = {
+        "positive": 0,
+        "negative": 0,
+        "neutral": 0,
+        "total": len(texts)
+    }
+    
+    try:
+        # Handle both formats: dict (YouTube) and string (news scraper)
+        text_list = []
+        for item in texts:
+            if isinstance(item, dict):
+                text = item.get('text', '')
+            elif isinstance(item, str):
+                text = item
+            else:
+                continue
+            
+            if text:
+                text_list.append(text)
+        
+        if not text_list:
+            return sentiments
+        
+        # Run inference in batches to avoid memory issues
+        batch_size = 32
+        for i in range(0, len(text_list), batch_size):
+            batch = text_list[i:i + batch_size]
+            results = model(batch)
+            
+            for result in results:
+                if isinstance(result, list) and len(result) > 0:
+                    # Get the label with highest score
+                    top_result = max(result, key=lambda x: x['score'])
+                    label = top_result['label'].lower()
+                    
+                    if 'positive' in label:
+                        sentiments["positive"] += 1
+                    elif 'negative' in label:
+                        sentiments["negative"] += 1
+                    else:
+                        sentiments["neutral"] += 1
+    
+    except Exception as e:
+        print(f"Error during sentiment analysis: {e}")
+    
+    return sentiments
+
+
+def compute_weighted_sentiment(
+    authoritative_content: list,
+    user_comments: list,
+    model,
+    authoritative_weight: float = 3.0,
+    user_weight: float = 1.0
+) -> Dict:
+    """
+    Compute weighted sentiment using the "Weighted Hybrid" model.
+    
+    Applies different weights to authoritative content (news) vs user comments:
+    - Authoritative content (news headlines): weight 3.0 (authoritative signal)
+    - User comments (social media): weight 1.0 (noisy signal)
+    
+    Formula: Score = (User_Sentiment * 1.0) + (Authoritative_Sentiment * 3.0)
+    
+    This mimics "Market Sentiment" vs "Retail Noise" in trading algorithms.
+    
+    Args:
+        authoritative_content: List of authoritative texts (news headlines)
+        user_comments: List of user comments (social media)
+        model: Sentiment analysis model
+        authoritative_weight: Weight for authoritative content (default: 3.0)
+        user_weight: Weight for user comments (default: 1.0)
+    
+    Returns:
+        Dictionary with weighted sentiment scores and breakdown
+    """
+    # Analyze authoritative content
+    auth_sentiment = analyze_sentiment(authoritative_content, model)
+    
+    # Analyze user comments
+    user_sentiment = analyze_sentiment(user_comments, model)
+    
+    # Calculate weighted scores
+    weighted_positive = (
+        (user_sentiment.get("positive", 0) * user_weight) +
+        (auth_sentiment.get("positive", 0) * authoritative_weight)
+    )
+    
+    weighted_negative = (
+        (user_sentiment.get("negative", 0) * user_weight) +
+        (auth_sentiment.get("negative", 0) * authoritative_weight)
+    )
+    
+    weighted_neutral = (
+        (user_sentiment.get("neutral", 0) * user_weight) +
+        (auth_sentiment.get("neutral", 0) * authoritative_weight)
+    )
+    
+    total_weighted = weighted_positive + weighted_negative + weighted_neutral
+    
+    # Calculate percentages
+    if total_weighted > 0:
+        positive_pct = (weighted_positive / total_weighted) * 100
+        negative_pct = (weighted_negative / total_weighted) * 100
+        neutral_pct = (weighted_neutral / total_weighted) * 100
+    else:
+        positive_pct = negative_pct = neutral_pct = 0.0
+    
+    return {
+        # Weighted counts
+        "weighted_positive": weighted_positive,
+        "weighted_negative": weighted_negative,
+        "weighted_neutral": weighted_neutral,
+        "total_weighted": total_weighted,
+        
+        # Percentages
+        "positive_percentage": positive_pct,
+        "negative_percentage": negative_pct,
+        "neutral_percentage": neutral_pct,
+        
+        # Raw counts (for reference)
+        "authoritative": {
+            "positive": auth_sentiment.get("positive", 0),
+            "negative": auth_sentiment.get("negative", 0),
+            "neutral": auth_sentiment.get("neutral", 0),
+            "total": auth_sentiment.get("total", 0)
+        },
+        "user_comments": {
+            "positive": user_sentiment.get("positive", 0),
+            "negative": user_sentiment.get("negative", 0),
+            "neutral": user_sentiment.get("neutral", 0),
+            "total": user_sentiment.get("total", 0)
+        },
+        
+        # Weights used
+        "weights": {
+            "authoritative": authoritative_weight,
+            "user": user_weight
+        }
+    }
+
+
+def process_job(job_id: str, data_system: DataSystem, model) -> bool:
+    """
+    Process a single job from the queue.
+    
+    Args:
+        job_id: UUID of the job to process
+        data_system: DataSystem instance for file operations
+        model: Sentiment analysis model
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        # Update status to PROCESSING
+        data_system.update_job_status(job_id, 'PROCESSING')
+        print(f"Processing job {job_id}...")
+        
+        # Get job details to find file_path
+        client = get_supabase_client()
+        if not client:
+            print("Error: Supabase client not available")
+            return False
+        
+        result = client.table('job_queue').select('file_path, metadata').eq('id', job_id).execute()
+        
+        if not result.data or len(result.data) == 0:
+            print(f"Job {job_id} not found")
+            return False
+        
+        job_data = result.data[0]
+        file_path = job_data.get('file_path')
+        
+        if not file_path:
+            print(f"No file_path found for job {job_id}")
+            data_system.update_job_status(job_id, 'FAILED')
+            return False
+        
+        # Download file from Storage
+        print(f"Downloading {file_path}...")
+        data = data_system.get_file_from_storage(file_path)
+        
+        if not data:
+            print(f"Failed to download {file_path}")
+            data_system.update_job_status(job_id, 'FAILED')
+            return False
+        
+        # Extract data components (Weighted Hybrid model)
+        authoritative_content = data.get('authoritative_content', [])  # News headlines (weight 3.0)
+        user_comments = data.get('user_comments', [])  # Social media comments (weight 1.0)
+        
+        # Backward compatibility: check old 'comments' field
+        if not user_comments and data.get('comments'):
+            user_comments = data.get('comments', [])
+        
+        if not authoritative_content and not user_comments:
+            print("No content found in data (neither authoritative_content nor user_comments)")
+            data_system.update_job_status(job_id, 'DONE')
+            return True
+        
+        # Detect location using Metadata-First strategy
+        print("Detecting location...")
+        detected_locations = detect_location(data)
+        print(f"  Detected locations: {detected_locations}")
+        
+        # Run weighted sentiment analysis (Weighted Hybrid model)
+        print(f"Running weighted sentiment analysis...")
+        print(f"  Authoritative content: {len(authoritative_content)} items (weight: 3.0)")
+        print(f"  User comments: {len(user_comments)} items (weight: 1.0)")
+        
+        sentiment_results = compute_weighted_sentiment(
+            authoritative_content=authoritative_content,
+            user_comments=user_comments,
+            model=model,
+            authoritative_weight=3.0,
+            user_weight=1.0
+        )
+        
+        # Print results (Weighted Hybrid model output)
+        print("Weighted Sentiment Analysis Results:")
+        print(f"  Weighted Positive: {sentiment_results.get('weighted_positive', 0):.2f} ({sentiment_results.get('positive_percentage', 0):.1f}%)")
+        print(f"  Weighted Negative: {sentiment_results.get('weighted_negative', 0):.2f} ({sentiment_results.get('negative_percentage', 0):.1f}%)")
+        print(f"  Weighted Neutral: {sentiment_results.get('weighted_neutral', 0):.2f} ({sentiment_results.get('neutral_percentage', 0):.1f}%)")
+        print(f"  Total Weighted Score: {sentiment_results.get('total_weighted', 0):.2f}")
+        print(f"  Locations: {detected_locations}")
+        
+        # Breakdown by source
+        print("\n  Breakdown by Source:")
+        print(f"    Authoritative (raw): {sentiment_results.get('authoritative', {})}")
+        print(f"    User Comments (raw): {sentiment_results.get('user_comments', {})}")
+        
+        # Update job status to DONE
+        data_system.update_job_status(job_id, 'DONE')
+        print(f"Job {job_id} completed successfully")
+        
+        return True
+    
+    except Exception as e:
+        print(f"Error processing job {job_id}: {str(e)}")
+        try:
+            data_system.update_job_status(job_id, 'FAILED')
+        except:
+            pass
+        return False
+
+
+def poll_and_process(poll_interval: int = 5):
+    """
+    Main consumer loop that polls the job queue and processes jobs.
+    
+    Args:
+        poll_interval: Seconds to wait between polls when no jobs are found
+    """
+    print("=" * 60)
+    print("Starting Sentiment Analysis Processor (Consumer)")
+    print("=" * 60)
+    print()
+    
+    # Initialize components
+    try:
+        data_system = DataSystem(bucket_name='raw_data')
+    except RuntimeError as e:
+        print(f"Error initializing DataSystem: {e}")
+        return
+    
+    # Load gazetteer first
+    load_gazetteer()
+    
+    model = load_sentiment_model()
+    if not model:
+        print("Error: Could not load sentiment model")
+        return
+    
+    print("Model loaded successfully")
+    print("Polling job queue for PENDING jobs...")
+    print()
+    
+    client = get_supabase_client()
+    if not client:
+        print("Error: Supabase client not available")
+        return
+    
+    # Main polling loop
+    while True:
+        try:
+            # Query for PENDING jobs
+            result = client.table('job_queue').select('id').eq('status', 'PENDING').limit(1).execute()
+            
+            if result.data and len(result.data) > 0:
+                job_id = result.data[0]['id']
+                process_job(job_id, data_system, model)
+                print()
+            else:
+                print(f"No pending jobs found. Waiting {poll_interval} seconds...")
+                time.sleep(poll_interval)
+        
+        except KeyboardInterrupt:
+            print("\nShutting down consumer...")
+            break
+        except Exception as e:
+            print(f"Error in polling loop: {str(e)}")
+            time.sleep(poll_interval)
+
+
+if __name__ == "__main__":
+    poll_and_process(poll_interval=5)
+
