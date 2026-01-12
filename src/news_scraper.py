@@ -24,11 +24,53 @@ from infra.data_manager import DataSystem
 
 
 # Daily Thanthi district URLs configuration
+# All 38 districts of Tamil Nadu
 DISTRICT_URLS = {
-    "Madurai": "https://www.dailythanthi.com/Districts/Madurai",
-    "Coimbatore": "https://www.dailythanthi.com/Districts/Coimbatore",
+    # Northern Districts
     "Chennai": "https://www.dailythanthi.com/Districts/Chennai",
+    "Chengalpattu": "https://www.dailythanthi.com/Districts/Chengalpattu",
+    "Kancheepuram": "https://www.dailythanthi.com/Districts/Kancheepuram",
+    "Thiruvallur": "https://www.dailythanthi.com/Districts/Thiruvallur",
+    "Vellore": "https://www.dailythanthi.com/Districts/Vellore",
+    "Ranipet": "https://www.dailythanthi.com/Districts/Ranipet",
+    "Tirupathur": "https://www.dailythanthi.com/Districts/Tirupattur",
+    "Tiruvannamalai": "https://www.dailythanthi.com/Districts/Tiruvannamalai",
+    "Villupuram": "https://www.dailythanthi.com/Districts/Villupuram",
+    "Kallakurichi": "https://www.dailythanthi.com/Districts/Kallakurichi",
+    
+    # Western Districts
     "Salem": "https://www.dailythanthi.com/Districts/Salem",
+    "Namakkal": "https://www.dailythanthi.com/Districts/Namakkal",
+    "Erode": "https://www.dailythanthi.com/Districts/Erode",
+    "Tiruppur": "https://www.dailythanthi.com/Districts/Tirupur",
+    "Coimbatore": "https://www.dailythanthi.com/Districts/Coimbatore",
+    "Nilgiris": "https://www.dailythanthi.com/Districts/Nilgiris",
+    "Dharmapuri": "https://www.dailythanthi.com/Districts/Dharmapuri",
+    "Krishnagiri": "https://www.dailythanthi.com/Districts/Krishnagiri",
+    
+    # Central Districts
+    "Tiruchirappalli": "https://www.dailythanthi.com/Districts/Trichy",
+    "Perambalur": "https://www.dailythanthi.com/Districts/Perambalur",
+    "Ariyalur": "https://www.dailythanthi.com/Districts/Ariyalur",
+    "Cuddalore": "https://www.dailythanthi.com/Districts/Cuddalore",
+    "Nagapattinam": "https://www.dailythanthi.com/Districts/Nagapattinam",
+    "Mayiladuthurai": "https://www.dailythanthi.com/Districts/Mayiladuthurai",
+    "Tiruvarur": "https://www.dailythanthi.com/Districts/Tiruvarur",
+    "Thanjavur": "https://www.dailythanthi.com/Districts/Thanjavur",
+    "Pudukkottai": "https://www.dailythanthi.com/Districts/Pudukkottai",
+    "Karur": "https://www.dailythanthi.com/Districts/Karur",
+    
+    # Southern Districts
+    "Madurai": "https://www.dailythanthi.com/Districts/Madurai",
+    "Theni": "https://www.dailythanthi.com/Districts/Theni",
+    "Dindigul": "https://www.dailythanthi.com/Districts/Dindigul",
+    "Sivaganga": "https://www.dailythanthi.com/Districts/Sivaganga",
+    "Ramanathapuram": "https://www.dailythanthi.com/Districts/Ramanathapuram",
+    "Virudhunagar": "https://www.dailythanthi.com/Districts/Virudhunagar",
+    "Thoothukudi": "https://www.dailythanthi.com/Districts/Thoothukudi",
+    "Tirunelveli": "https://www.dailythanthi.com/Districts/Tirunelveli",
+    "Tenkasi": "https://www.dailythanthi.com/Districts/Tenkasi",
+    "Kanyakumari": "https://www.dailythanthi.com/Districts/Kanyakumari",
 }
 
 # User-Agent header to avoid blocking

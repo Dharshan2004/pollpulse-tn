@@ -24,14 +24,19 @@ def load_keywords():
     """
     Load keywords from alliances.json configuration file.
     
+    The JSON structure is: {"keywords": {"DMK_Front": [...], "ADMK_Front": [...]}}
+    
     Returns:
         List of tuples: (alliance_name, query_string)
     """
     with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
         data = json.load(f)
     
+    # Access the 'keywords' key to get the actual alliance dictionary
+    keywords_data = data.get('keywords', data)
+    
     queries = []
-    for alliance, query_list in data.items():
+    for alliance, query_list in keywords_data.items():
         for query in query_list:
             queries.append((alliance, query))
     

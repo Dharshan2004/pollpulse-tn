@@ -30,6 +30,10 @@ from infra.data_manager import DataSystem
 GAZETTEER_PATH = os.path.join("config", "districts.json")
 GAZETTEER = {}
 
+# Load alliances configuration
+ALLIANCES_PATH = os.path.join("config", "alliances.json")
+ALLIANCES = {}
+
 
 def load_gazetteer() -> Dict:
     """
@@ -50,6 +54,247 @@ def load_gazetteer() -> Dict:
     except Exception as e:
         print(f"Error loading gazetteer: {e}")
         return {}
+
+
+def load_alliances() -> Dict:
+    """
+    Load the alliances configuration from config/alliances.json.
+    
+    Returns:
+        Dictionary with 'keywords' mapping alliance names to their keywords
+    """
+    global ALLIANCES
+    if ALLIANCES:
+        return ALLIANCES
+    
+    try:
+        with open(ALLIANCES_PATH, 'r', encoding='utf-8') as f:
+            ALLIANCES = json.load(f)
+        keywords = ALLIANCES.get('keywords', {})
+        print(f"Loaded alliances: {list(keywords.keys())}")
+        return ALLIANCES
+    except Exception as e:
+        print(f"Error loading alliances: {e}")
+        return {}
+
+
+def detect_alliance(data: Dict) -> str:
+    """
+    Detect which political alliance the content belongs to.
+    
+    Priority:
+    1. Use meta['alliance'] if provided by producer (unless it's "keywords" - a known bug)
+    2. Keyword match against title/description
+    
+    Args:
+        data: Full JSON payload
+    
+    Returns:
+        Alliance name (e.g., "DMK_Front") or "Unknown"
+    """
+    # Load alliances config first to get valid alliance names
+    alliances = load_alliances()
+    keywords_map = alliances.get('keywords', {})
+    valid_alliances = set(keywords_map.keys())
+    
+    # Priority 1: Check if alliance is already set by producer
+    meta = data.get('meta', {})
+    producer_alliance = meta.get('alliance', '')
+    
+    # Only use producer alliance if it's valid (not empty, not "Unknown", not "keywords")
+    if producer_alliance and producer_alliance != 'Unknown' and producer_alliance in valid_alliances:
+        return producer_alliance
+    
+    # If producer set "keywords" (bug from old discover.py), log warning and re-detect
+    if producer_alliance == 'keywords':
+        print(f"  Warning: Producer set alliance='keywords' (bug). Re-detecting from content...")
+    
+    # Priority 2: Keyword match against title/description
+    title = (meta.get('title', '') or '').lower()
+    description = (meta.get('description', '') or '').lower()
+    text_to_search = f"{title} {description}"
+    
+    for alliance_name, keywords in keywords_map.items():
+        for keyword in keywords:
+            if keyword.lower() in text_to_search:
+                return alliance_name
+    
+    return "Unknown"
+
+
+def get_all_constituencies() -> List[str]:
+    """
+    Get all 234 constituencies from the gazetteer.
+    
+    Returns:
+        List of all constituency names
+    """
+    gazetteer = load_gazetteer()
+    constituencies = []
+    for district_data in gazetteer.values():
+        constituencies.extend(district_data.get('constituencies', []))
+    return constituencies
+
+
+def get_constituencies_for_districts(districts: List[str]) -> List[str]:
+    """
+    Get constituencies for specific districts.
+    
+    Args:
+        districts: List of district names
+    
+    Returns:
+        List of constituency names for those districts
+    """
+    gazetteer = load_gazetteer()
+    constituencies = []
+    
+    for district in districts:
+        if district in gazetteer:
+            constituencies.extend(gazetteer[district].get('constituencies', []))
+    
+    return constituencies
+
+
+def calculate_sentiment_score(sentiment_results: Dict) -> float:
+    """
+    Calculate a single sentiment score from weighted results.
+    
+    Score ranges from -1.0 (very negative) to +1.0 (very positive).
+    
+    Formula: (positive - negative) / total
+    
+    Args:
+        sentiment_results: Output from compute_weighted_sentiment()
+    
+    Returns:
+        Sentiment score between -1.0 and +1.0
+    """
+    weighted_positive = sentiment_results.get('weighted_positive', 0)
+    weighted_negative = sentiment_results.get('weighted_negative', 0)
+    total_weighted = sentiment_results.get('total_weighted', 0)
+    
+    if total_weighted == 0:
+        return 0.0
+    
+    # Score: (positive - negative) / total
+    # Ranges from -1.0 (all negative) to +1.0 (all positive)
+    score = (weighted_positive - weighted_negative) / total_weighted
+    return round(score, 4)
+
+
+def upsert_constituency_prediction(
+    client,
+    constituency_name: str,
+    alliance_name: str,
+    current_score: float,
+    is_state_wide: bool = False
+) -> bool:
+    """
+    Upsert a constituency prediction using moving average.
+    
+    Formula: New_Score = (Old_Score * 0.9) + (Current_Score * 0.1)
+    For State_Wide: New_Score = (Old_Score * 0.95) + (Current_Score * 0.05)
+    
+    Args:
+        client: Supabase client
+        constituency_name: Name of the constituency
+        alliance_name: Name of the political alliance
+        current_score: Current sentiment score (-1.0 to +1.0)
+        is_state_wide: If True, apply lower weight (0.05 instead of 0.1)
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        # Set decay factor based on whether this is local or state-wide
+        if is_state_wide:
+            decay_factor = 0.95  # Old score weight
+            new_factor = 0.05   # New score weight (lower for state-wide)
+        else:
+            decay_factor = 0.9  # Old score weight
+            new_factor = 0.1   # New score weight
+        
+        # Check if row exists
+        result = client.table('constituency_predictions').select('sentiment_score').eq(
+            'constituency_name', constituency_name
+        ).eq('alliance_name', alliance_name).execute()
+        
+        if result.data and len(result.data) > 0:
+            # Row exists - update with moving average
+            old_score = result.data[0].get('sentiment_score', 0.0)
+            new_score = (old_score * decay_factor) + (current_score * new_factor)
+            new_score = round(new_score, 4)
+            
+            client.table('constituency_predictions').update({
+                'sentiment_score': new_score,
+                'last_updated': 'now()'
+            }).eq('constituency_name', constituency_name).eq(
+                'alliance_name', alliance_name
+            ).execute()
+        else:
+            # Row doesn't exist - insert new
+            client.table('constituency_predictions').insert({
+                'constituency_name': constituency_name,
+                'alliance_name': alliance_name,
+                'sentiment_score': current_score,
+                'last_updated': 'now()'
+            }).execute()
+        
+        return True
+    except Exception as e:
+        print(f"Error upserting prediction for {constituency_name}/{alliance_name}: {e}")
+        return False
+
+
+def persist_predictions(
+    client,
+    detected_locations: List[str],
+    alliance_name: str,
+    sentiment_score: float
+) -> int:
+    """
+    Persist sentiment predictions to the database.
+    
+    Handles both local (specific districts) and state-wide updates.
+    
+    Args:
+        client: Supabase client
+        detected_locations: List of detected districts or ["State_Wide"]
+        alliance_name: Political alliance name
+        sentiment_score: Sentiment score (-1.0 to +1.0)
+    
+    Returns:
+        Number of constituencies updated
+    """
+    if alliance_name == "Unknown":
+        print("  Skipping persistence: Unknown alliance")
+        return 0
+    
+    updated_count = 0
+    
+    if "State_Wide" in detected_locations:
+        # State-wide: Update ALL constituencies with lower weight
+        print(f"  Persisting to ALL constituencies (State_Wide, weight: 0.05)")
+        constituencies = get_all_constituencies()
+        
+        for constituency in constituencies:
+            if upsert_constituency_prediction(
+                client, constituency, alliance_name, sentiment_score, is_state_wide=True
+            ):
+                updated_count += 1
+    else:
+        # Local: Update only constituencies in detected districts
+        constituencies = get_constituencies_for_districts(detected_locations)
+        print(f"  Persisting to {len(constituencies)} constituencies in {detected_locations}")
+        
+        for constituency in constituencies:
+            if upsert_constituency_prediction(
+                client, constituency, alliance_name, sentiment_score, is_state_wide=False
+            ):
+                updated_count += 1
+    
+    return updated_count
 
 
 def detect_location(data: Dict) -> List[str]:
@@ -448,6 +693,24 @@ def process_job(job_id: str, data_system: DataSystem, model) -> bool:
         print(f"    Authoritative (raw): {sentiment_results.get('authoritative', {})}")
         print(f"    User Comments (raw): {sentiment_results.get('user_comments', {})}")
         
+        # Detect alliance
+        alliance_name = detect_alliance(data)
+        print(f"\n  Alliance: {alliance_name}")
+        
+        # Calculate sentiment score (-1.0 to +1.0)
+        sentiment_score = calculate_sentiment_score(sentiment_results)
+        print(f"  Sentiment Score: {sentiment_score}")
+        
+        # Persist predictions to database
+        print("\nPersisting predictions...")
+        updated_count = persist_predictions(
+            client=client,
+            detected_locations=detected_locations,
+            alliance_name=alliance_name,
+            sentiment_score=sentiment_score
+        )
+        print(f"  Updated {updated_count} constituency predictions")
+        
         # Update job status to DONE
         data_system.update_job_status(job_id, 'DONE')
         print(f"Job {job_id} completed successfully")
@@ -482,8 +745,9 @@ def poll_and_process(poll_interval: int = 5):
         print(f"Error initializing DataSystem: {e}")
         return
     
-    # Load gazetteer first
+    # Load configuration
     load_gazetteer()
+    load_alliances()
     
     model = load_sentiment_model()
     if not model:
