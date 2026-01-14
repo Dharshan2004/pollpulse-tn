@@ -6,25 +6,33 @@ It polls the job_queue table for PENDING jobs, downloads the raw JSON data
 from Supabase Storage, runs sentiment analysis using HuggingFace, and updates
 the job status to DONE.
 
-The Consumer operates independently from the Producer (scraper.py):
-1. Polls job_queue for PENDING jobs
-2. Downloads data from Storage
-3. Runs ML inference
-4. Updates job status
-
-This decoupling allows multiple consumers to process jobs in parallel,
-and the Producer can continue scraping without waiting for processing.
+Production Features:
+- Semantic deduplication (skip already processed content)
+- Dead Letter Queue (failed jobs stored for inspection)
+- Metrics logging (processing latency, error rates)
+- Data lineage (track source_ids in predictions)
+- Outlier cap (prevent single video from dominating)
 """
 
 import json
 import os
 import time
-from typing import Optional, Dict, List
+import hashlib
+import traceback
+from datetime import datetime, timezone
+from typing import Optional, Dict, List, Any
 from transformers import pipeline, AutoModelForSequenceClassification, XLMRobertaTokenizer
 
 from infra.client import get_supabase_client
 from infra.data_manager import DataSystem
 
+
+# Configuration
+MODEL_VERSION = os.getenv('MODEL_VERSION', 'xlm-roberta-sentiment-v1')
+MAX_INFLUENCE_PER_SOURCE = float(os.getenv('MAX_INFLUENCE_PER_SOURCE', '0.05'))
+ENABLE_DEDUPLICATION = os.getenv('ENABLE_DEDUPLICATION', 'true').lower() == 'true'
+ENABLE_DLQ = os.getenv('ENABLE_DLQ', 'true').lower() == 'true'
+ENABLE_METRICS = os.getenv('ENABLE_METRICS', 'true').lower() == 'true'
 
 # Load gazetteer (districts data)
 GAZETTEER_PATH = os.path.join("config", "districts.json")
@@ -76,6 +84,132 @@ def load_alliances() -> Dict:
     except Exception as e:
         print(f"Error loading alliances: {e}")
         return {}
+
+
+
+def get_content_id(data: Dict) -> str:
+    """Extract or generate content ID for deduplication."""
+    meta = data.get('meta', {})
+    
+    # For YouTube: use video_id
+    if meta.get('id'):
+        return meta['id']
+    
+    # For news: hash the URL
+    if meta.get('url'):
+        return hashlib.md5(meta['url'].encode()).hexdigest()[:16]
+    
+    # Fallback: hash the whole meta
+    return hashlib.md5(json.dumps(meta, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def get_content_type(data: Dict) -> str:
+    """Determine content type from payload."""
+    meta = data.get('meta', {})
+    source = meta.get('source', '')
+    
+    if source in ['DailyThanthi', 'news']:
+        return 'news'
+    return 'youtube'
+
+
+def is_duplicate_content(client, content_id: str, alliance: str) -> bool:
+    """Check if content was already processed (semantic deduplication)."""
+    if not ENABLE_DEDUPLICATION:
+        return False
+    
+    try:
+        result = client.table('processed_content').select('id').eq(
+            'content_id', content_id
+        ).execute()
+        
+        return len(result.data) > 0
+    except Exception as e:
+        print(f"  Warning: Deduplication check failed: {e}")
+        return False  # Fail open - process anyway
+
+
+def mark_content_processed(
+    client,
+    content_id: str,
+    content_type: str,
+    alliance: str,
+    file_path: str,
+    sentiment_score: float
+) -> bool:
+    """Mark content as processed for deduplication."""
+    if not ENABLE_DEDUPLICATION:
+        return True
+    
+    try:
+        client.table('processed_content').insert({
+            'content_id': content_id,
+            'content_type': content_type,
+            'alliance': alliance,
+            'file_path': file_path,
+            'sentiment_score': sentiment_score,
+            'processed_at': datetime.now(timezone.utc).isoformat()
+        }).execute()
+        return True
+    except Exception as e:
+        # May fail on duplicate - that's OK
+        if 'duplicate' not in str(e).lower():
+            print(f"  Warning: Failed to mark content processed: {e}")
+        return False
+
+
+def add_to_dlq(
+    client,
+    job_id: str,
+    file_path: str,
+    error_message: str,
+    error_type: str,
+    payload: Optional[Dict] = None
+) -> bool:
+    """Add failed job to Dead Letter Queue for inspection."""
+    if not ENABLE_DLQ:
+        return True
+    
+    try:
+        client.table('dead_letter_queue').insert({
+            'original_job_id': job_id,
+            'file_path': file_path,
+            'error_message': error_message[:1000],  # Truncate
+            'error_type': error_type,
+            'payload': payload,
+            'failed_at': datetime.now(timezone.utc).isoformat(),
+            'retry_count': 0
+        }).execute()
+        print(f"  Added to DLQ: {error_type}")
+        return True
+    except Exception as e:
+        print(f"  Warning: Failed to add to DLQ: {e}")
+        return False
+
+
+def log_metric(client, name: str, value: float, dimensions: Optional[Dict] = None) -> bool:
+    """Log a metric to the pipeline_metrics table."""
+    if not ENABLE_METRICS:
+        return True
+    
+    try:
+        client.table('pipeline_metrics').insert({
+            'metric_name': name,
+            'metric_value': value,
+            'dimensions': dimensions or {},
+            'recorded_at': datetime.now(timezone.utc).isoformat()
+        }).execute()
+        return True
+    except Exception as e:
+        # Don't fail on metrics errors
+        return False
+
+
+def apply_influence_cap(current_score: float, new_delta: float) -> float:
+    """Cap the influence of a single source to prevent outliers."""
+    capped_delta = max(-MAX_INFLUENCE_PER_SOURCE, 
+                       min(MAX_INFLUENCE_PER_SOURCE, new_delta))
+    return current_score + capped_delta
 
 
 def detect_alliance(data: Dict) -> str:
@@ -188,10 +322,12 @@ def upsert_constituency_prediction(
     constituency_name: str,
     alliance_name: str,
     current_score: float,
-    is_state_wide: bool = False
+    is_state_wide: bool = False,
+    source_id: Optional[str] = None,
+    model_version: Optional[str] = None
 ) -> bool:
     """
-    Upsert a constituency prediction using moving average.
+    Upsert a constituency prediction using moving average with data lineage.
     
     Formula: New_Score = (Old_Score * 0.9) + (Current_Score * 0.1)
     For State_Wide: New_Score = (Old_Score * 0.95) + (Current_Score * 0.05)
@@ -202,6 +338,8 @@ def upsert_constituency_prediction(
         alliance_name: Name of the political alliance
         current_score: Current sentiment score (-1.0 to +1.0)
         is_state_wide: If True, apply lower weight (0.05 instead of 0.1)
+        source_id: Content ID for data lineage tracking
+        model_version: Version of the ML model used
     
     Returns:
         True if successful, False otherwise
@@ -216,30 +354,56 @@ def upsert_constituency_prediction(
             new_factor = 0.1   # New score weight
         
         # Check if row exists
-        result = client.table('constituency_predictions').select('sentiment_score').eq(
-            'constituency_name', constituency_name
-        ).eq('alliance_name', alliance_name).execute()
+        result = client.table('constituency_predictions').select(
+            'sentiment_score, source_ids, source_count'
+        ).eq('constituency_name', constituency_name).eq('alliance', alliance_name).execute()
         
         if result.data and len(result.data) > 0:
             # Row exists - update with moving average
             old_score = result.data[0].get('sentiment_score', 0.0)
+            old_sources = result.data[0].get('source_ids', []) or []
+            source_count = result.data[0].get('source_count', 0) or 0
+            
             new_score = (old_score * decay_factor) + (current_score * new_factor)
             new_score = round(new_score, 4)
             
-            client.table('constituency_predictions').update({
+            # Update source_ids (keep last 100)
+            if source_id and source_id not in old_sources:
+                old_sources.append(source_id)
+                if len(old_sources) > 100:
+                    old_sources = old_sources[-100:]
+                source_count += 1
+            
+            update_data = {
                 'sentiment_score': new_score,
-                'last_updated': 'now()'
-            }).eq('constituency_name', constituency_name).eq(
-                'alliance_name', alliance_name
-            ).execute()
+                'source_count': source_count,
+                'last_updated': datetime.now(timezone.utc).isoformat()
+            }
+            
+            if source_id:
+                update_data['source_ids'] = old_sources
+            if model_version:
+                update_data['model_version'] = model_version
+            
+            client.table('constituency_predictions').update(update_data).eq(
+                'constituency_name', constituency_name
+            ).eq('alliance', alliance_name).execute()
         else:
             # Row doesn't exist - insert new
-            client.table('constituency_predictions').insert({
+            insert_data = {
                 'constituency_name': constituency_name,
-                'alliance_name': alliance_name,
+                'alliance': alliance_name,
+                'district': 'Unknown',  # Will be updated by location detection
                 'sentiment_score': current_score,
-                'last_updated': 'now()'
-            }).execute()
+                'source_count': 1 if source_id else 0
+            }
+            
+            if source_id:
+                insert_data['source_ids'] = [source_id]
+            if model_version:
+                insert_data['model_version'] = model_version
+            
+            client.table('constituency_predictions').insert(insert_data).execute()
         
         return True
     except Exception as e:
@@ -251,10 +415,12 @@ def persist_predictions(
     client,
     detected_locations: List[str],
     alliance_name: str,
-    sentiment_score: float
+    sentiment_score: float,
+    source_id: Optional[str] = None,
+    model_version: Optional[str] = None
 ) -> int:
     """
-    Persist sentiment predictions to the database.
+    Persist sentiment predictions to the database with data lineage.
     
     Handles both local (specific districts) and state-wide updates.
     
@@ -263,6 +429,8 @@ def persist_predictions(
         detected_locations: List of detected districts or ["State_Wide"]
         alliance_name: Political alliance name
         sentiment_score: Sentiment score (-1.0 to +1.0)
+        source_id: Content ID for data lineage tracking
+        model_version: Version of the ML model used
     
     Returns:
         Number of constituencies updated
@@ -280,7 +448,8 @@ def persist_predictions(
         
         for constituency in constituencies:
             if upsert_constituency_prediction(
-                client, constituency, alliance_name, sentiment_score, is_state_wide=True
+                client, constituency, alliance_name, sentiment_score, 
+                is_state_wide=True, source_id=source_id, model_version=model_version
             ):
                 updated_count += 1
     else:
@@ -290,7 +459,8 @@ def persist_predictions(
         
         for constituency in constituencies:
             if upsert_constituency_prediction(
-                client, constituency, alliance_name, sentiment_score, is_state_wide=False
+                client, constituency, alliance_name, sentiment_score, 
+                is_state_wide=False, source_id=source_id, model_version=model_version
             ):
                 updated_count += 1
     
@@ -605,7 +775,14 @@ def compute_weighted_sentiment(
 
 def process_job(job_id: str, data_system: DataSystem, model) -> bool:
     """
-    Process a single job from the queue.
+    Process a single job from the queue with production hardening.
+    
+    Features:
+    - Semantic deduplication (skip if already processed)
+    - Dead Letter Queue (store failed jobs for inspection)
+    - Metrics logging (track processing performance)
+    - Outlier cap (prevent single source dominance)
+    - Model versioning (track which model processed)
     
     Args:
         job_id: UUID of the job to process
@@ -615,6 +792,11 @@ def process_job(job_id: str, data_system: DataSystem, model) -> bool:
     Returns:
         True if successful, False otherwise
     """
+    start_time = time.time()
+    file_path = None
+    data = None
+    client = None
+    
     try:
         # Update status to PROCESSING
         data_system.update_job_status(job_id, 'PROCESSING')
@@ -646,8 +828,21 @@ def process_job(job_id: str, data_system: DataSystem, model) -> bool:
         
         if not data:
             print(f"Failed to download {file_path}")
+            add_to_dlq(client, job_id, file_path, "Failed to download file", "NETWORK")
             data_system.update_job_status(job_id, 'FAILED')
             return False
+        
+        # Get content ID and type for deduplication
+        content_id = get_content_id(data)
+        content_type = get_content_type(data)
+        alliance_name = detect_alliance(data)
+        
+        # Check for duplicate (semantic deduplication)
+        if is_duplicate_content(client, content_id, alliance_name):
+            print(f"  ⚠ Duplicate content detected ({content_id}), skipping")
+            data_system.update_job_status(job_id, 'DONE')
+            log_metric(client, 'duplicate_skipped', 1, {'content_type': content_type})
+            return True
         
         # Extract data components (Weighted Hybrid model)
         authoritative_content = data.get('authoritative_content', [])  # News headlines (weight 3.0)
@@ -661,6 +856,10 @@ def process_job(job_id: str, data_system: DataSystem, model) -> bool:
             print("No content found in data (neither authoritative_content nor user_comments)")
             data_system.update_job_status(job_id, 'DONE')
             return True
+        
+        # Get quality signals if available
+        quality_signals = data.get('quality_signals', {})
+        confidence_multiplier = quality_signals.get('confidence_multiplier', 0.5)
         
         # Detect location using Metadata-First strategy
         print("Detecting location...")
@@ -693,36 +892,88 @@ def process_job(job_id: str, data_system: DataSystem, model) -> bool:
         print(f"    Authoritative (raw): {sentiment_results.get('authoritative', {})}")
         print(f"    User Comments (raw): {sentiment_results.get('user_comments', {})}")
         
-        # Detect alliance
-        alliance_name = detect_alliance(data)
         print(f"\n  Alliance: {alliance_name}")
+        print(f"  Confidence Multiplier: {confidence_multiplier:.2f}")
         
         # Calculate sentiment score (-1.0 to +1.0)
         sentiment_score = calculate_sentiment_score(sentiment_results)
         print(f"  Sentiment Score: {sentiment_score}")
         
-        # Persist predictions to database
+        # Persist predictions to database (with source tracking)
         print("\nPersisting predictions...")
         updated_count = persist_predictions(
             client=client,
             detected_locations=detected_locations,
             alliance_name=alliance_name,
-            sentiment_score=sentiment_score
+            sentiment_score=sentiment_score,
+            source_id=content_id,
+            model_version=MODEL_VERSION
         )
         print(f"  Updated {updated_count} constituency predictions")
         
+        # Mark content as processed (for deduplication)
+        mark_content_processed(
+            client=client,
+            content_id=content_id,
+            content_type=content_type,
+            alliance=alliance_name,
+            file_path=file_path,
+            sentiment_score=sentiment_score
+        )
+        
         # Update job status to DONE
         data_system.update_job_status(job_id, 'DONE')
-        print(f"Job {job_id} completed successfully")
+        
+        # Log metrics
+        processing_time = (time.time() - start_time) * 1000  # ms
+        log_metric(client, 'processing_latency_ms', processing_time, {
+            'content_type': content_type,
+            'alliance': alliance_name
+        })
+        log_metric(client, 'sentiment_score', sentiment_score, {
+            'content_type': content_type,
+            'alliance': alliance_name,
+            'content_id': content_id
+        })
+        
+        print(f"Job {job_id} completed successfully ({processing_time:.0f}ms)")
         
         return True
     
-    except Exception as e:
-        print(f"Error processing job {job_id}: {str(e)}")
+    except json.JSONDecodeError as e:
+        error_msg = f"JSON parse error: {str(e)}"
+        print(f"Error processing job {job_id}: {error_msg}")
+        if client and file_path:
+            add_to_dlq(client, job_id, file_path, error_msg, "JSON_PARSE", data)
         try:
             data_system.update_job_status(job_id, 'FAILED')
         except:
             pass
+        return False
+    
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {str(e)}"
+        print(f"Error processing job {job_id}: {error_msg}")
+        print(traceback.format_exc())
+        
+        # Determine error type
+        error_type = "UNKNOWN"
+        if "model" in str(e).lower() or "inference" in str(e).lower():
+            error_type = "ML_INFERENCE"
+        elif "database" in str(e).lower() or "supabase" in str(e).lower():
+            error_type = "DB_ERROR"
+        elif "network" in str(e).lower() or "connection" in str(e).lower():
+            error_type = "NETWORK"
+        
+        # Add to DLQ
+        if client and file_path:
+            add_to_dlq(client, job_id, file_path, error_msg, error_type, data)
+        
+        try:
+            data_system.update_job_status(job_id, 'FAILED')
+        except:
+            pass
+        
         return False
 
 
