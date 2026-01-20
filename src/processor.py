@@ -19,6 +19,7 @@ import os
 import time
 import hashlib
 import traceback
+import math 
 from datetime import datetime, timezone
 from typing import Optional, Dict, List, Any
 from transformers import pipeline, AutoModelForSequenceClassification, XLMRobertaTokenizer
@@ -33,6 +34,12 @@ MAX_INFLUENCE_PER_SOURCE = float(os.getenv('MAX_INFLUENCE_PER_SOURCE', '0.05'))
 ENABLE_DEDUPLICATION = os.getenv('ENABLE_DEDUPLICATION', 'true').lower() == 'true'
 ENABLE_DLQ = os.getenv('ENABLE_DLQ', 'true').lower() == 'true'
 ENABLE_METRICS = os.getenv('ENABLE_METRICS', 'true').lower() == 'true'
+
+FRESHNESS_HALF_LIFE_DAYS = float(os.getenv('FRESHNESS_HALF_LIFE_DAYS', '14'))  # Half-life for decay
+ENABLE_ENGAGEMENT_WEIGHTING = os.getenv('ENABLE_ENGAGEMENT_WEIGHTING', 'true').lower() == 'true'
+ENABLE_PROBABILITY_SCORING = os.getenv('ENABLE_PROBABILITY_SCORING', 'true').lower() == 'true'
+ENABLE_OUTLIER_CAP = os.getenv('ENABLE_OUTLIER_CAP', 'true').lower() == 'true'
+
 
 # Load gazetteer (districts data)
 GAZETTEER_PATH = os.path.join("config", "districts.json")
@@ -207,9 +214,120 @@ def log_metric(client, name: str, value: float, dimensions: Optional[Dict] = Non
 
 def apply_influence_cap(current_score: float, new_delta: float) -> float:
     """Cap the influence of a single source to prevent outliers."""
+    if not ENABLE_OUTLIER_CAP:
+        return current_score + new_delta
     capped_delta = max(-MAX_INFLUENCE_PER_SOURCE, 
                        min(MAX_INFLUENCE_PER_SOURCE, new_delta))
     return current_score + capped_delta
+
+
+def calculate_freshness_decay(last_updated: datetime) -> float:
+    """
+    Calculate time-weighted decay factor based on how stale the prediction is.
+    
+    Uses exponential decay with configurable half-life.
+    Formula: decay = exp(-ln(2) * days_old / half_life)
+    
+    Args:
+        last_updated: When the prediction was last updated
+        
+    Returns:
+        Decay factor between 0.0 and 1.0 (1.0 = fresh, approaches 0 = stale)
+    """
+    if last_updated is None:
+        return 1.0
+    
+    now = datetime.now(timezone.utc)
+    
+    # Handle timezone-naive datetime
+    if last_updated.tzinfo is None:
+        last_updated = last_updated.replace(tzinfo=timezone.utc)
+    
+    days_old = (now - last_updated).total_seconds() / 86400  # Convert to days
+    
+    if days_old <= 0:
+        return 1.0
+    
+    # Exponential decay: decay_factor = exp(-ln(2) * days / half_life)
+    decay_factor = math.exp(-0.693 * days_old / FRESHNESS_HALF_LIFE_DAYS)
+    
+    return max(0.01, decay_factor)  # Minimum 1% to prevent complete zeroing
+
+
+def get_engagement_weight(likes: int) -> float:
+    """
+    Calculate engagement weight using logarithmic scaling.
+    
+    A comment with 1000 likes should count more than one with 1 like,
+    but not 1000x more (diminishing returns).
+    
+    Formula: weight = 1 + log10(1 + likes)
+    
+    Args:
+        likes: Number of likes on the comment
+        
+    Returns:
+        Weight multiplier (1.0 for 0 likes, ~4.0 for 1000 likes)
+    """
+    if not ENABLE_ENGAGEMENT_WEIGHTING or likes <= 0:
+        return 1.0
+    
+    return 1.0 + math.log10(1 + likes)
+
+
+def apply_freshness_to_predictions(client) -> int:
+    """
+    Apply freshness decay to all predictions in the database.
+    
+    This should be run periodically (e.g., daily) to decay stale predictions.
+    
+    Args:
+        client: Supabase client
+        
+    Returns:
+        Number of predictions updated
+    """
+    try:
+        # Get all predictions with their timestamps
+        result = client.table('constituency_predictions').select(
+            'id, constituency_name, alliance, sentiment_score, confidence_weight, last_updated'
+        ).execute()
+        
+        if not result.data:
+            return 0
+        
+        updated_count = 0
+        
+        for prediction in result.data:
+            last_updated_str = prediction.get('last_updated')
+            if not last_updated_str:
+                continue
+            
+            # Parse timestamp
+            try:
+                last_updated = datetime.fromisoformat(last_updated_str.replace('Z', '+00:00'))
+            except:
+                continue
+            
+            # Calculate decay
+            decay = calculate_freshness_decay(last_updated)
+            current_confidence = prediction.get('confidence_weight', 0.5)
+            
+            # Apply decay to confidence (not sentiment score)
+            new_confidence = current_confidence * decay
+            
+            # Only update if significantly changed (>1% difference)
+            if abs(new_confidence - current_confidence) > 0.01:
+                client.table('constituency_predictions').update({
+                    'confidence_weight': round(new_confidence, 4)
+                }).eq('id', prediction['id']).execute()
+                updated_count += 1
+        
+        return updated_count
+    
+    except Exception as e:
+        print(f"Error applying freshness decay: {e}")
+        return 0
 
 
 def detect_alliance(data: Dict) -> str:
@@ -324,13 +442,18 @@ def upsert_constituency_prediction(
     current_score: float,
     is_state_wide: bool = False,
     source_id: Optional[str] = None,
-    model_version: Optional[str] = None
+    model_version: Optional[str] = None,
+    avg_confidence: float = 0.5
 ) -> bool:
     """
-    Upsert a constituency prediction using moving average with data lineage.
+    Upsert a constituency prediction with enhancements.
     
-    Formula: New_Score = (Old_Score * 0.9) + (Current_Score * 0.1)
-    For State_Wide: New_Score = (Old_Score * 0.95) + (Current_Score * 0.05)
+    Sprint 2 Features:
+    - Outlier cap: Limits influence of any single source
+    - Confidence weighting: Uses model confidence in weight calculation
+    
+    Formula: New_Score = Old_Score + capped_delta
+    Where capped_delta = cap(current_score * new_factor - old_score * (1-decay_factor))
     
     Args:
         client: Supabase client
@@ -340,6 +463,7 @@ def upsert_constituency_prediction(
         is_state_wide: If True, apply lower weight (0.05 instead of 0.1)
         source_id: Content ID for data lineage tracking
         model_version: Version of the ML model used
+        avg_confidence: Average model confidence (0.0-1.0)
     
     Returns:
         True if successful, False otherwise
@@ -347,25 +471,32 @@ def upsert_constituency_prediction(
     try:
         # Set decay factor based on whether this is local or state-wide
         if is_state_wide:
-            decay_factor = 0.95  # Old score weight
             new_factor = 0.05   # New score weight (lower for state-wide)
         else:
-            decay_factor = 0.9  # Old score weight
             new_factor = 0.1   # New score weight
         
         # Check if row exists
         result = client.table('constituency_predictions').select(
-            'sentiment_score, source_ids, source_count'
+            'sentiment_score, confidence_weight, source_ids, source_count'
         ).eq('constituency_name', constituency_name).eq('alliance', alliance_name).execute()
         
         if result.data and len(result.data) > 0:
-            # Row exists - update with moving average
+            # Row exists - update with moving average + outlier cap
             old_score = result.data[0].get('sentiment_score', 0.0)
+            old_confidence = result.data[0].get('confidence_weight', 0.5)
             old_sources = result.data[0].get('source_ids', []) or []
             source_count = result.data[0].get('source_count', 0) or 0
             
-            new_score = (old_score * decay_factor) + (current_score * new_factor)
-            new_score = round(new_score, 4)
+            # Calculate delta (what this source would contribute)
+            raw_delta = (current_score - old_score) * new_factor
+            
+            # Sprint 2: Apply outlier cap to prevent single source dominance
+            new_score = apply_influence_cap(old_score, raw_delta)
+            new_score = round(max(-1.0, min(1.0, new_score)), 4)  # Clamp to [-1, 1]
+            
+            # Update confidence weight (blend old and new, weighted by avg_confidence)
+            new_confidence = (old_confidence * 0.8) + (avg_confidence * 0.2)
+            new_confidence = round(new_confidence, 4)
             
             # Update source_ids (keep last 100)
             if source_id and source_id not in old_sources:
@@ -376,6 +507,7 @@ def upsert_constituency_prediction(
             
             update_data = {
                 'sentiment_score': new_score,
+                'confidence_weight': new_confidence,
                 'source_count': source_count,
                 'last_updated': datetime.now(timezone.utc).isoformat()
             }
@@ -389,12 +521,16 @@ def upsert_constituency_prediction(
                 'constituency_name', constituency_name
             ).eq('alliance', alliance_name).execute()
         else:
-            # Row doesn't exist - insert new
+            # Row doesn't exist - insert new (cap for initial score too)
+            initial_score = apply_influence_cap(0.0, current_score * new_factor)
+            initial_score = round(max(-1.0, min(1.0, initial_score)), 4)
+            
             insert_data = {
                 'constituency_name': constituency_name,
                 'alliance': alliance_name,
                 'district': 'Unknown',  # Will be updated by location detection
-                'sentiment_score': current_score,
+                'sentiment_score': initial_score,
+                'confidence_weight': avg_confidence,
                 'source_count': 1 if source_id else 0
             }
             
@@ -417,10 +553,11 @@ def persist_predictions(
     alliance_name: str,
     sentiment_score: float,
     source_id: Optional[str] = None,
-    model_version: Optional[str] = None
+    model_version: Optional[str] = None,
+    avg_confidence: float = 0.5
 ) -> int:
     """
-    Persist sentiment predictions to the database with data lineage.
+    Persist sentiment predictions to the database with Sprint 2 enhancements.
     
     Handles both local (specific districts) and state-wide updates.
     
@@ -431,6 +568,7 @@ def persist_predictions(
         sentiment_score: Sentiment score (-1.0 to +1.0)
         source_id: Content ID for data lineage tracking
         model_version: Version of the ML model used
+        avg_confidence: Average model confidence (Sprint 2)
     
     Returns:
         Number of constituencies updated
@@ -449,7 +587,8 @@ def persist_predictions(
         for constituency in constituencies:
             if upsert_constituency_prediction(
                 client, constituency, alliance_name, sentiment_score, 
-                is_state_wide=True, source_id=source_id, model_version=model_version
+                is_state_wide=True, source_id=source_id, model_version=model_version,
+                avg_confidence=avg_confidence
             ):
                 updated_count += 1
     else:
@@ -460,7 +599,8 @@ def persist_predictions(
         for constituency in constituencies:
             if upsert_constituency_prediction(
                 client, constituency, alliance_name, sentiment_score, 
-                is_state_wide=False, source_id=source_id, model_version=model_version
+                is_state_wide=False, source_id=source_id, model_version=model_version,
+                avg_confidence=avg_confidence
             ):
                 updated_count += 1
     
@@ -618,60 +758,113 @@ def load_sentiment_model():
 
 def analyze_sentiment(texts: list, model) -> Dict:
     """
-    Run sentiment analysis on a list of texts (comments or headlines).
+    Run sentiment analysis on a list of texts with Sprint 2 enhancements.
+    
+    Features:
+    - Engagement weighting: Comments with more likes count more
+    - Probability scoring: Uses model confidence, not just top label
     
     Args:
-        texts: List of text items (can be dict with 'text' key or plain strings)
+        texts: List of text items (can be dict with 'text'/'likes' keys or plain strings)
         model: HuggingFace pipeline model
     
     Returns:
-        Dictionary with sentiment statistics (raw counts)
+        Dictionary with sentiment statistics (weighted counts and probabilities)
     """
     if not model:
         return {"error": "Model not available"}
     
     sentiments = {
-        "positive": 0,
-        "negative": 0,
-        "neutral": 0,
-        "total": len(texts)
+        "positive": 0.0,
+        "negative": 0.0,
+        "neutral": 0.0,
+        "total": len(texts),
+        # Sprint 2: Probability-based scores
+        "positive_prob": 0.0,
+        "negative_prob": 0.0,
+        "neutral_prob": 0.0,
+        "total_weight": 0.0,
+        "avg_confidence": 0.0
     }
     
     try:
         # Handle both formats: dict (YouTube) and string (news scraper)
         text_list = []
+        likes_list = []  # Sprint 2: Track likes for engagement weighting
+        
         for item in texts:
             if isinstance(item, dict):
                 text = item.get('text', '')
+                likes = item.get('likes', 0) or item.get('like_count', 0) or 0
             elif isinstance(item, str):
                 text = item
+                likes = 0
             else:
                 continue
             
             if text:
                 text_list.append(text)
+                likes_list.append(likes)
         
         if not text_list:
             return sentiments
+        
+        sentiments["total"] = len(text_list)
+        total_confidence = 0.0
         
         # Run inference in batches to avoid memory issues
         batch_size = 32
         for i in range(0, len(text_list), batch_size):
             batch = text_list[i:i + batch_size]
-            results = model(batch)
+            batch_likes = likes_list[i:i + batch_size]
             
-            for result in results:
-                if isinstance(result, list) and len(result) > 0:
-                    # Get the label with highest score
-                    top_result = max(result, key=lambda x: x['score'])
-                    label = top_result['label'].lower()
+            # Request all scores (not just top-1) for probability scoring
+            results = model(batch, top_k=None) if ENABLE_PROBABILITY_SCORING else model(batch)
+            
+            for idx, result in enumerate(results):
+                # Get engagement weight for this item
+                engagement_weight = get_engagement_weight(batch_likes[idx])
+                sentiments["total_weight"] += engagement_weight
+                
+                if ENABLE_PROBABILITY_SCORING and isinstance(result, list):
+                    # Sprint 2: Use full probability distribution
+                    for score_item in result:
+                        label = score_item['label'].lower()
+                        prob = score_item['score']
+                        weighted_prob = prob * engagement_weight
+                        
+                        if 'positive' in label:
+                            sentiments["positive_prob"] += weighted_prob
+                            sentiments["positive"] += weighted_prob
+                        elif 'negative' in label:
+                            sentiments["negative_prob"] += weighted_prob
+                            sentiments["negative"] += weighted_prob
+                        else:
+                            sentiments["neutral_prob"] += weighted_prob
+                            sentiments["neutral"] += weighted_prob
                     
-                    if 'positive' in label:
-                        sentiments["positive"] += 1
-                    elif 'negative' in label:
-                        sentiments["negative"] += 1
-                    else:
-                        sentiments["neutral"] += 1
+                    # Track confidence (highest probability)
+                    if result:
+                        top_prob = max(r['score'] for r in result)
+                        total_confidence += top_prob
+                else:
+                    # Legacy: Binary classification (top label only)
+                    if isinstance(result, list) and len(result) > 0:
+                        top_result = max(result, key=lambda x: x['score'])
+                        label = top_result['label'].lower()
+                        confidence = top_result['score']
+                        total_confidence += confidence
+                        
+                        if 'positive' in label:
+                            sentiments["positive"] += engagement_weight
+                        elif 'negative' in label:
+                            sentiments["negative"] += engagement_weight
+                        else:
+                            sentiments["neutral"] += engagement_weight
+        
+        # Calculate average confidence
+        if sentiments["total"] > 0:
+            sentiments["avg_confidence"] = round(total_confidence / sentiments["total"], 4)
     
     except Exception as e:
         print(f"Error during sentiment analysis: {e}")
@@ -739,6 +932,20 @@ def compute_weighted_sentiment(
     else:
         positive_pct = negative_pct = neutral_pct = 0.0
     
+    # Sprint 2: Calculate combined average confidence
+    auth_conf = auth_sentiment.get('avg_confidence', 0.5)
+    user_conf = user_sentiment.get('avg_confidence', 0.5)
+    auth_count = auth_sentiment.get('total', 0)
+    user_count = user_sentiment.get('total', 0)
+    
+    if auth_count + user_count > 0:
+        # Weighted average confidence based on sample sizes
+        combined_avg_confidence = (
+            (auth_conf * auth_count + user_conf * user_count) / (auth_count + user_count)
+        )
+    else:
+        combined_avg_confidence = 0.5
+    
     return {
         # Weighted counts
         "weighted_positive": weighted_positive,
@@ -751,18 +958,23 @@ def compute_weighted_sentiment(
         "negative_percentage": negative_pct,
         "neutral_percentage": neutral_pct,
         
+        # Sprint 2: Average model confidence
+        "avg_confidence": round(combined_avg_confidence, 4),
+        
         # Raw counts (for reference)
         "authoritative": {
             "positive": auth_sentiment.get("positive", 0),
             "negative": auth_sentiment.get("negative", 0),
             "neutral": auth_sentiment.get("neutral", 0),
-            "total": auth_sentiment.get("total", 0)
+            "total": auth_sentiment.get("total", 0),
+            "avg_confidence": auth_conf
         },
         "user_comments": {
             "positive": user_sentiment.get("positive", 0),
             "negative": user_sentiment.get("negative", 0),
             "neutral": user_sentiment.get("neutral", 0),
-            "total": user_sentiment.get("total", 0)
+            "total": user_sentiment.get("total", 0),
+            "avg_confidence": user_conf
         },
         
         # Weights used
@@ -899,7 +1111,11 @@ def process_job(job_id: str, data_system: DataSystem, model) -> bool:
         sentiment_score = calculate_sentiment_score(sentiment_results)
         print(f"  Sentiment Score: {sentiment_score}")
         
-        # Persist predictions to database (with source tracking)
+        # Get average confidence from sentiment results
+        avg_confidence = sentiment_results.get('avg_confidence', 0.5)
+        print(f"  Avg Model Confidence: {avg_confidence:.3f}")
+        
+        # Persist predictions to database (with source tracking + Sprint 2 confidence)
         print("\nPersisting predictions...")
         updated_count = persist_predictions(
             client=client,
@@ -907,7 +1123,8 @@ def process_job(job_id: str, data_system: DataSystem, model) -> bool:
             alliance_name=alliance_name,
             sentiment_score=sentiment_score,
             source_id=content_id,
-            model_version=MODEL_VERSION
+            model_version=MODEL_VERSION,
+            avg_confidence=avg_confidence
         )
         print(f"  Updated {updated_count} constituency predictions")
         
