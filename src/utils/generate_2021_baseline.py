@@ -6,125 +6,114 @@ This baseline is used for:
 1. Calculating swing predictions (current sentiment vs historical margin)
 2. Identifying vulnerable seats (low margin = high swing potential)
 3. Validating sentiment predictions against historical voting patterns
+
+DECOUPLED DESIGN:
+- Alliance mappings are read from config/alliances_2021.json
+- Update the config file to change mappings without touching code
+- Same pattern used for 2026 predictions (config/alliances_2026.json)
 """
 
 import json
 import pandas as pd
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 # Path setup
 SCRIPT_DIR = Path(__file__).parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 CSV_PATH = PROJECT_ROOT / "2021 election data.csv"
-CONFIG_PATH = PROJECT_ROOT / "config" / "districts.json"
+ALLIANCE_CONFIG_PATH = PROJECT_ROOT / "config" / "alliances_2021.json"
+DISTRICTS_CONFIG_PATH = PROJECT_ROOT / "config" / "districts.json"
 OUTPUT_PATH = PROJECT_ROOT / "data" / "2021_baseline.json"
 
 # ============================================================
-# 2021 ALLIANCE MAPPINGS (Accurate)
+# ALLIANCE MAPPING (Config-Driven)
 # ============================================================
 
-# DMK+ Alliance (Secular Progressive Alliance - SPA)
-DMK_ALLIANCE_PARTIES = {
-    'DMK',      # Dravida Munnetra Kazhagam
-    'INC',      # Indian National Congress
-    'VCK',      # Viduthalai Chiruthaigal Katchi
-    'CPI',      # Communist Party of India
-    'CPI(M)',   # Communist Party of India (Marxist)
-    'CPM',      # Alias for CPI(M)
-    'MDMK',     # Marumalarchi Dravida Munnetra Kazhagam (Vaiko)
-    'IUML',     # Indian Union Muslim League
-    'KMDK',     # Kongunadu Makkal Desia Katchi
-    'MMK',      # Manithaneya Makkal Katchi
-    'AIFB',     # All India Forward Bloc
-    'ATP',      # Adi Tamilar Peravai
-    'MVK',      # Makkal Viduthalai Katchi
-}
+# Cache for loaded alliance config
+_alliance_config: Optional[Dict] = None
+_party_to_alliance_map: Optional[Dict[str, str]] = None
 
-# ADMK+ Alliance (NDA)
-ADMK_ALLIANCE_PARTIES = {
-    'ADMK',     # All India Anna Dravida Munnetra Kazhagam
-    'AIADMK',   # Alias for ADMK
-    'PMK',      # Pattali Makkal Katchi
-    'BJP',      # Bharatiya Janata Party
-    'TMC(M)',   # Tamil Maanila Congress (Moopanar)
-    'TMMK',     # Tamizhaga Makkal Munnetra Kazhagam
-    'PBK',      # Puratchi Bharatham Katchi
-    'PDK',      # Pasumpon Desiya Kazhagam
-}
 
-# AMMK Front (TTV Dhinakaran)
-AMMK_FRONT_PARTIES = {
-    'AMMK',     # Amma Makkal Munnettra Kazagam
-    'DMDK',     # Desiya Murpokku Dravida Kazhagam (Vijayakanth)
-    'SDPI',     # Social Democratic Party of India
-    'AIMIM',    # All India Majlis-e-Ittehadul Muslimeen
-}
+def load_alliance_config(config_path: Path = ALLIANCE_CONFIG_PATH) -> Dict:
+    """Load alliance configuration from JSON file."""
+    global _alliance_config
+    
+    if _alliance_config is not None:
+        return _alliance_config
+    
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"Alliance config not found: {config_path}\n"
+            "Please create config/alliances_2021.json with party-to-alliance mappings."
+        )
+    
+    with open(config_path, 'r', encoding='utf-8') as f:
+        _alliance_config = json.load(f)
+    
+    print(f"Loaded alliance config from: {config_path}")
+    return _alliance_config
 
-# MNM Front (Kamal Haasan)
-MNM_FRONT_PARTIES = {
-    'MNM',      # Makkal Needhi Maiam
-    'IJK',      # Indiya Jananayaka Katchi
-    'AISMK',    # All India Samathuva Makkal Katchi
-    'JDS',      # Janata Dal (Secular)
-}
 
-# NTK - Contested Alone
-NTK_PARTIES = {
-    'NTK',      # Naam Tamilar Katchi (Seeman)
-}
+def build_party_to_alliance_map(config: Dict = None) -> Dict[str, str]:
+    """Build a flat party -> alliance lookup from config."""
+    global _party_to_alliance_map
+    
+    if _party_to_alliance_map is not None:
+        return _party_to_alliance_map
+    
+    if config is None:
+        config = load_alliance_config()
+    
+    _party_to_alliance_map = {}
+    
+    for alliance_key, alliance_data in config.get('alliances', {}).items():
+        for party in alliance_data.get('parties', []):
+            # Store both original and uppercase for flexible matching
+            _party_to_alliance_map[party.upper()] = alliance_key
+    
+    return _party_to_alliance_map
 
 
 def map_party_to_alliance(party: str) -> str:
-    """Map individual party to alliance based on 2021 coalition structure."""
+    """
+    Map individual party to alliance based on config.
+    
+    This function is config-driven - update alliances_2021.json to change mappings.
+    """
     party_clean = party.strip().upper()
     
-    # Exact match first (most reliable)
-    if party_clean in {p.upper() for p in DMK_ALLIANCE_PARTIES}:
-        return "DMK_Alliance"
+    # Load mapping from config
+    party_map = build_party_to_alliance_map()
     
-    if party_clean in {p.upper() for p in ADMK_ALLIANCE_PARTIES}:
-        return "ADMK_Alliance"
+    # Direct lookup
+    if party_clean in party_map:
+        return party_map[party_clean]
     
-    if party_clean in {p.upper() for p in AMMK_FRONT_PARTIES}:
-        return "AMMK_Front"
+    # Fuzzy matching for common variations not in config
+    # These are fallbacks for data inconsistencies
     
-    if party_clean in {p.upper() for p in MNM_FRONT_PARTIES}:
-        return "MNM_Front"
+    # Congress variations
+    if 'CONGRESS' in party_clean and 'INC' in party_map:
+        return party_map.get('INC', 'Others')
     
-    if party_clean in {p.upper() for p in NTK_PARTIES}:
-        return "NTK"
+    # Communist variations
+    if 'COMMUNIST' in party_clean or party_clean.startswith('CPI'):
+        if 'CPI' in party_map:
+            return party_map['CPI']
+        if 'CPI(M)' in party_map:
+            return party_map['CPI(M)']
+        if 'CPM' in party_map:
+            return party_map['CPM']
     
-    # Fuzzy matching for variations
-    # DMK Alliance variations
-    if any(x in party_clean for x in ['CONGRESS', 'INC']):
-        return "DMK_Alliance"
-    if 'COMMUNIST' in party_clean or 'CPI' in party_clean:
-        return "DMK_Alliance"
-    
-    # ADMK Alliance variations  
+    # AIADMK/ADMK variations
     if 'AIADMK' in party_clean or party_clean == 'ADMK':
-        return "ADMK_Alliance"
-    if party_clean == 'PMK' or 'PATTALI' in party_clean:
-        return "ADMK_Alliance"
-    if party_clean == 'BJP' or 'BHARATIYA JANATA' in party_clean:
-        return "ADMK_Alliance"
+        if 'ADMK' in party_map:
+            return party_map['ADMK']
+        if 'AIADMK' in party_map:
+            return party_map['AIADMK']
     
-    # AMMK variations
-    if 'AMMK' in party_clean or 'AMMA MAKKAL' in party_clean:
-        return "AMMK_Front"
-    if 'DMDK' in party_clean or 'VIJAYAKANTH' in party_clean:
-        return "AMMK_Front"
-    
-    # MNM variations
-    if 'MNM' in party_clean or 'MAKKAL NEEDHI' in party_clean or 'KAMAL' in party_clean:
-        return "MNM_Front"
-    
-    # NTK variations
-    if 'NTK' in party_clean or 'NAAM TAMILAR' in party_clean or 'SEEMAN' in party_clean:
-        return "NTK"
-    
-    # Independent or unrecognized
+    # Independent
     if party_clean == 'IND' or 'INDEPENDENT' in party_clean:
         return "Independent"
     
@@ -133,8 +122,8 @@ def map_party_to_alliance(party: str) -> str:
 
 def load_districts_config() -> Dict:
     """Load districts.json for constituency-district mapping validation."""
-    if CONFIG_PATH.exists():
-        with open(CONFIG_PATH, 'r') as f:
+    if DISTRICTS_CONFIG_PATH.exists():
+        with open(DISTRICTS_CONFIG_PATH, 'r') as f:
             return json.load(f)
     return {}
 
