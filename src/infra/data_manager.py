@@ -46,7 +46,7 @@ class DataSystem:
             storage_client = self.client.storage.from_(self.bucket_name)
             # Try to list bucket (will fail if bucket doesn't exist)
             storage_client.list(limit=1)
-                print(f"Storage bucket '{bucket_name}' verified")
+            print(f"Storage bucket '{bucket_name}' verified")
         except Exception as e:
             error_msg = str(e).lower()
             if 'bucket' in error_msg and ('not found' in error_msg or 'does not exist' in error_msg):
