@@ -58,12 +58,17 @@ jobs:
           echo "Discovering YouTube videos..."
           python src/discover.py
         env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           MAX_VIDEOS_PER_ALLIANCE: ${{ github.event.inputs.max_videos || '5' }}
       
       - name: Run YouTube Scraper
         run: |
           echo "Scraping comments and transcripts..."
           python src/scraper.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         timeout-minutes: 30
       
       - name: Upload scrape logs
@@ -101,6 +106,9 @@ jobs:
         run: |
           echo "Scraping news headlines from Daily Thanthi..."
           python src/news_scraper.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         timeout-minutes: 15
       
       - name: Upload news scrape logs
@@ -150,6 +158,8 @@ jobs:
           timeout 1800 python src/processor.py || true
         timeout-minutes: 35
         env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           ENABLE_DEDUPLICATION: 'true'
           ENABLE_DLQ: 'true'
           ENABLE_METRICS: 'true'
@@ -227,6 +237,9 @@ jobs:
               print(f"  {alliance:20s}: {stats['count']:3d} predictions | Avg Sentiment: {avg_sentiment:+.2f} | Sources: {stats['sources']}")
           print("=" * 60)
           EOF
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
 
   # ==================================================
   # Job 5: Notify on Failure
