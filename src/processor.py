@@ -49,6 +49,10 @@ GAZETTEER = {}
 ALLIANCES_PATH = os.path.join("config", "alliances.json")
 ALLIANCES = {}
 
+# Load entity map for politician routing
+ENTITY_MAP_PATH = os.path.join("config", "entity_map.json")
+ENTITY_MAP = {}
+
 
 def load_gazetteer() -> Dict:
     """
@@ -91,6 +95,93 @@ def load_alliances() -> Dict:
     except Exception as e:
         print(f"Error loading alliances: {e}")
         return {}
+
+
+def load_entity_map() -> Dict:
+    """
+    Load the entity map for politician-to-constituency routing.
+    
+    Returns:
+        Dictionary with politicians, alias_index, and constituency_politicians
+    """
+    global ENTITY_MAP
+    if ENTITY_MAP:
+        return ENTITY_MAP
+    
+    try:
+        with open(ENTITY_MAP_PATH, 'r', encoding='utf-8') as f:
+            ENTITY_MAP = json.load(f)
+        print(f"Loaded entity map: {len(ENTITY_MAP.get('politicians', {}))} politicians")
+        return ENTITY_MAP
+    except FileNotFoundError:
+        print("Entity map not found. Run src/discover_entities.py to generate it.")
+        return {}
+    except Exception as e:
+        print(f"Error loading entity map: {e}")
+        return {}
+
+
+def detect_politicians(data: Dict) -> List[Dict]:
+    """
+    Detect politician mentions in content and return their constituencies.
+    
+    This enables routing sentiment to specific constituencies when a 
+    politician is mentioned (e.g., "Stalin speech" -> KOLATHUR).
+    
+    Args:
+        data: Full JSON payload containing meta, transcript, comments
+        
+    Returns:
+        List of matched politicians with their constituencies:
+        [{"name": "M. K. Stalin", "constituency": "KOLATHUR", "party": "DMK"}]
+    """
+    entity_map = load_entity_map()
+    if not entity_map:
+        return []
+    
+    alias_index = entity_map.get('alias_index', {})
+    politicians = entity_map.get('politicians', {})
+    
+    # Combine all text sources
+    meta = data.get('meta', {})
+    title = (meta.get('title', '') or '').lower()
+    description = (meta.get('description', '') or '')[:500].lower()
+    transcript = (data.get('transcript', '') or '')[:2000].lower()
+    
+    # Build comment text
+    comments = data.get('user_comments', []) or data.get('comments', [])
+    comment_text = ""
+    for comment in comments[:50]:  # Limit to first 50 comments
+        if isinstance(comment, dict):
+            comment_text += " " + (comment.get('text', '') or '').lower()
+        elif isinstance(comment, str):
+            comment_text += " " + comment.lower()
+    
+    combined_text = f"{title} {description} {transcript} {comment_text}"
+    
+    matched = []
+    matched_names = set()  # Avoid duplicates
+    
+    for alias, normalized_name in alias_index.items():
+        # Check if alias appears in text (word boundary aware)
+        # Use simple "in" check for speed, could use regex for precision
+        if alias in combined_text and normalized_name not in matched_names:
+            politician_data = politicians.get(normalized_name, {})
+            constituency = politician_data.get('constituency')
+            
+            if constituency:  # Only add if has constituency mapping
+                matched.append({
+                    "name": politician_data.get('canonical_name', alias),
+                    "constituency": constituency,
+                    "party": politician_data.get('party', ''),
+                    "matched_alias": alias
+                })
+                matched_names.add(normalized_name)
+    
+    if matched:
+        print(f"  Politicians detected: {[m['name'] for m in matched]}")
+    
+    return matched
 
 
 
@@ -1078,6 +1169,13 @@ def process_job(job_id: str, data_system: DataSystem, model) -> bool:
         detected_locations = detect_location(data)
         print(f"  Detected locations: {detected_locations}")
         
+        # Detect politician mentions for constituency-level routing
+        print("Detecting politicians...")
+        detected_politicians = detect_politicians(data)
+        politician_constituencies = [p['constituency'] for p in detected_politicians if p.get('constituency')]
+        if politician_constituencies:
+            print(f"  Politician-based constituencies: {politician_constituencies}")
+        
         # Run weighted sentiment analysis (Weighted Hybrid model)
         print(f"Running weighted sentiment analysis...")
         print(f"  Authoritative content: {len(authoritative_content)} items (weight: 3.0)")
@@ -1126,7 +1224,25 @@ def process_job(job_id: str, data_system: DataSystem, model) -> bool:
             model_version=MODEL_VERSION,
             avg_confidence=avg_confidence
         )
-        print(f"  Updated {updated_count} constituency predictions")
+        print(f"  Updated {updated_count} constituency predictions (district-based)")
+        
+        # Persist politician-specific constituency predictions (higher precision)
+        if politician_constituencies:
+            print(f"  Routing to politician constituencies: {politician_constituencies}")
+            for constituency in politician_constituencies:
+                # Update specific constituency with boosted confidence (politician mention = high precision)
+                boosted_confidence = min(avg_confidence * 1.2, 1.0)  # 20% confidence boost
+                upsert_constituency_prediction(
+                    client=client,
+                    constituency_name=constituency,
+                    district="POLITICIAN_ROUTED",  # Special marker for debugging
+                    alliance=alliance_name,
+                    new_score=sentiment_score,
+                    source_id=content_id,
+                    model_version=MODEL_VERSION,
+                    avg_confidence=boosted_confidence
+                )
+            print(f"  Updated {len(politician_constituencies)} politician-routed constituencies")
         
         # Mark content as processed (for deduplication)
         mark_content_processed(
@@ -1216,6 +1332,7 @@ def poll_and_process(poll_interval: int = 5):
     # Load configuration
     load_gazetteer()
     load_alliances()
+    load_entity_map()  # For politician-to-constituency routing
     
     model = load_sentiment_model()
     if not model:

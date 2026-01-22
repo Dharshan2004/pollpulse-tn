@@ -10,17 +10,88 @@ The scraper:
 2. Maps headlines to the 'comments' field for existing NLP pipeline compatibility
 3. Includes location_override field for guaranteed location accuracy
 4. Uploads data to Supabase Storage via DataSystem
+5. SECURITY: Only scrapes from whitelisted domains to prevent spam/malicious content
 """
 
 import json
 import os
 import time
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from datetime import datetime
+from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
 
 from infra.data_manager import DataSystem
+
+
+# ============================================================
+# DOMAIN WHITELIST - Security Feature
+# ============================================================
+# Only these domains are allowed to be scraped.
+# This prevents:
+# 1. Accidental scraping of non-news sites
+# 2. Injection of malicious URLs
+# 3. Spam content entering the pipeline
+
+ALLOWED_DOMAINS = {
+    # Primary source - Tamil news
+    "dailythanthi.com",
+    "www.dailythanthi.com",
+    
+    # Other reputable Tamil news sources (for future expansion)
+    "dinamalar.com",
+    "www.dinamalar.com",
+    "dinamani.com",
+    "www.dinamani.com",
+    "dinakaran.com",
+    "www.dinakaran.com",
+    "vikatan.com",
+    "www.vikatan.com",
+    "thehindu.com",
+    "www.thehindu.com",
+    "newindianexpress.com",
+    "www.newindianexpress.com",
+    "deccanchronicle.com",
+    "www.deccanchronicle.com",
+    "timesofindia.indiatimes.com",
+    
+    # Tamil Nadu government sources
+    "tn.gov.in",
+    "www.tn.gov.in",
+}
+
+
+def is_domain_allowed(url: str) -> Tuple[bool, str]:
+    """
+    Check if URL domain is in the whitelist.
+    
+    Args:
+        url: URL to validate
+        
+    Returns:
+        Tuple of (is_allowed, reason)
+    """
+    try:
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        
+        if not domain:
+            return False, "Invalid URL: no domain found"
+        
+        # Check exact match
+        if domain in ALLOWED_DOMAINS:
+            return True, f"Domain '{domain}' is whitelisted"
+        
+        # Check if it's a subdomain of an allowed domain
+        for allowed in ALLOWED_DOMAINS:
+            if domain.endswith('.' + allowed) or domain == allowed:
+                return True, f"Domain '{domain}' is a subdomain of whitelisted '{allowed}'"
+        
+        return False, f"Domain '{domain}' is NOT in whitelist. Allowed: {sorted(ALLOWED_DOMAINS)[:5]}..."
+    
+    except Exception as e:
+        return False, f"URL parsing error: {e}"
 
 
 # Daily Thanthi district URLs configuration
@@ -82,17 +153,25 @@ HEADERS = {
 MAX_HEADLINES_PER_DISTRICT = int(os.getenv('MAX_HEADLINES_PER_DISTRICT', '20'))
 
 
-def fetch_page(url: str, timeout: int = 10) -> Optional[str]:
+def fetch_page(url: str, timeout: int = 10, skip_whitelist: bool = False) -> Optional[str]:
     """
     Fetch HTML content from a URL.
     
     Args:
         url: URL to fetch
         timeout: Request timeout in seconds
+        skip_whitelist: If True, skip domain whitelist check (use with caution)
     
     Returns:
         HTML content as string, or None if error
     """
+    # Domain whitelist check (security feature)
+    if not skip_whitelist:
+        is_allowed, reason = is_domain_allowed(url)
+        if not is_allowed:
+            print(f"  BLOCKED: {reason}")
+            return None
+    
     try:
         response = requests.get(url, headers=HEADERS, timeout=timeout)
         response.raise_for_status()
@@ -227,22 +306,56 @@ def scrape_district_news(district: str, url: str) -> Optional[Dict]:
     return structured_data
 
 
-def scrape_news_portals(district_urls: Optional[Dict[str, str]] = None):
+def scrape_news_portals(district_urls: Optional[Dict[str, str]] = None, validate_only: bool = False):
     """
     Main scraping function for news portals.
     
     Scrapes headlines from each district page and uploads to Supabase
     via DataSystem. Follows the same Producer pattern as scraper.py.
     
+    SECURITY: All URLs are validated against the domain whitelist before scraping.
+    
     Args:
         district_urls: Optional dictionary mapping district names to URLs.
                       If None, uses default DISTRICT_URLS.
+        validate_only: If True, only validate URLs without scraping (for testing)
     """
     if district_urls is None:
         district_urls = DISTRICT_URLS
     
     if not district_urls:
         print("No district URLs provided")
+        return
+    
+    # ============================================================
+    # SECURITY: Validate all URLs against whitelist before starting
+    # ============================================================
+    print("Validating URLs against domain whitelist...")
+    blocked_urls = []
+    valid_urls = {}
+    
+    for district, url in district_urls.items():
+        is_allowed, reason = is_domain_allowed(url)
+        if is_allowed:
+            valid_urls[district] = url
+        else:
+            blocked_urls.append((district, url, reason))
+            print(f"  BLOCKED: {district} - {reason}")
+    
+    if blocked_urls:
+        print(f"\nWARNING: {len(blocked_urls)} URLs blocked by whitelist:")
+        for district, url, reason in blocked_urls:
+            print(f"  - {district}: {url}")
+        print()
+    
+    if not valid_urls:
+        print("ERROR: No valid URLs to scrape after whitelist validation")
+        return
+    
+    print(f"Validated {len(valid_urls)} URLs (blocked {len(blocked_urls)})")
+    
+    if validate_only:
+        print("\nValidation mode - skipping actual scraping")
         return
     
     # Initialize DataSystem for Supabase operations
@@ -253,11 +366,16 @@ def scrape_news_portals(district_urls: Optional[Dict[str, str]] = None):
         print("Cannot proceed without Supabase connection.")
         return
     
+    print()
     print("=" * 60)
     print("Starting News Portal Scraper (High Confidence Location)")
-    print(f"Total districts to process: {len(district_urls)}")
+    print(f"Total districts to process: {len(valid_urls)}")
+    print(f"Whitelisted domains: {len(ALLOWED_DOMAINS)}")
     print("=" * 60)
     print()
+    
+    # Use only valid URLs for scraping
+    district_urls = valid_urls
     
     for i, (district, url) in enumerate(district_urls.items(), 1):
         print(f"[{i}/{len(district_urls)}] Processing: {district}")
