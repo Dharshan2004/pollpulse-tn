@@ -361,6 +361,10 @@ def scrape_news_portals(district_urls: Optional[Dict[str, str]] = None, validate
     # Initialize DataSystem for Supabase operations
     try:
         data_system = DataSystem(bucket_name='raw_data')
+        print("\nVerifying Supabase setup...")
+        if not data_system.verify_setup():
+            print("\n[WARN] WARNING: Setup verification failed. Jobs may not be created.")
+            print("Fix the issues above before continuing.\n")
     except RuntimeError as e:
         print(f"Error initializing DataSystem: {e}")
         print("Cannot proceed without Supabase connection.")
@@ -377,6 +381,9 @@ def scrape_news_portals(district_urls: Optional[Dict[str, str]] = None, validate
     # Use only valid URLs for scraping
     district_urls = valid_urls
     
+    jobs_created = 0
+    districts_skipped = 0
+    
     for i, (district, url) in enumerate(district_urls.items(), 1):
         print(f"[{i}/{len(district_urls)}] Processing: {district}")
         
@@ -386,6 +393,7 @@ def scrape_news_portals(district_urls: Optional[Dict[str, str]] = None, validate
             
             if not data:
                 print(f"  Skipping {district} (no data extracted)")
+                districts_skipped += 1
                 continue
             
             # Prepare metadata for job queue
@@ -409,10 +417,12 @@ def scrape_news_portals(district_urls: Optional[Dict[str, str]] = None, validate
             )
             
             if job_id:
+                jobs_created += 1
                 print(f"  Uploaded {len(data.get('authoritative_content', []))} headlines")
                 print(f"  Job {job_id} created in queue")
             else:
-                print(f"  Failed to upload data")
+                districts_skipped += 1
+                print(f"  FAILED to upload data - check logs above")
         
         except Exception as e:
             print(f"  Error processing {district}: {str(e)[:100]}")
@@ -425,6 +435,33 @@ def scrape_news_portals(district_urls: Optional[Dict[str, str]] = None, validate
     print()
     print("=" * 60)
     print("News Scraping Complete!")
+    print("=" * 60)
+    print(f"Summary:")
+    print(f"  Districts processed: {len(district_urls)}")
+    print(f"  Jobs created: {jobs_created}")
+    print(f"  Districts skipped: {districts_skipped} (no data or save failed)")
+    
+    # Verify jobs were actually created in database
+    if jobs_created > 0:
+        try:
+            from infra.client import get_supabase_client
+            client = get_supabase_client()
+            if client:
+                result = client.table('job_queue').select('id', count='exact').eq('status', 'PENDING').execute()
+                pending_count = result.count or 0
+                print(f"\nVerification:")
+                print(f"  PENDING jobs in queue: {pending_count}")
+                if pending_count < jobs_created:
+                    print(f"  [WARN] Expected {jobs_created} jobs but found {pending_count} in queue")
+        except Exception as e:
+            print(f"  [WARN] Could not verify jobs in database: {str(e)[:100]}")
+    
+    if jobs_created == 0:
+        print(f"\n[WARN] WARNING: No jobs were created!")
+        print(f"  - Check if headlines are being extracted")
+        print(f"  - Check Supabase connection and storage permissions")
+        print(f"  - Check job_queue table exists (run schema.sql)")
+        print(f"  - Check storage bucket 'raw_data' exists")
     print("=" * 60)
 
 

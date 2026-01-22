@@ -26,8 +26,6 @@ on:
 
 env:
   PYTHON_VERSION: '3.11'
-  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-  SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
 
 jobs:
   # ==================================================
@@ -36,7 +34,13 @@ jobs:
   scrape-youtube:
     name: Scrape YouTube Content
     runs-on: ubuntu-latest
-    if: github.event.inputs.run_scrapers != false
+    if: |
+      github.event_name == 'schedule' || 
+      github.event.inputs.run_scrapers != false
+    
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
     
     steps:
       - name: Checkout repository
@@ -53,22 +57,26 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       
-      - name: Run YouTube Discovery
+      - name: Verify Supabase credentials
         run: |
-          echo "Discovering YouTube videos..."
-          python src/discover.py
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          MAX_VIDEOS_PER_ALLIANCE: ${{ github.event.inputs.max_videos || '5' }}
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_KEY" ]; then
+            echo "ERROR: SUPABASE_URL or SUPABASE_KEY not set!"
+            exit 1
+          else
+            echo "[OK] Supabase credentials are set"
+            echo "  URL: ${SUPABASE_URL:0:30}..."
+            echo "  Key: ${SUPABASE_KEY:0:20}..."
+          fi
       
       - name: Run YouTube Scraper
         run: |
-          echo "Scraping comments and transcripts..."
+          echo "Discovering and scraping YouTube videos..."
+          echo "This will discover videos and scrape comments/transcripts..."
           python src/scraper.py
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          MAX_VIDEOS_PER_ALLIANCE: ${{ github.event.inputs.max_videos || '5' }}
         timeout-minutes: 30
       
       - name: Upload scrape logs
@@ -85,7 +93,13 @@ jobs:
   scrape-news:
     name: Scrape News Headlines
     runs-on: ubuntu-latest
-    if: github.event.inputs.run_scrapers != false
+    if: |
+      github.event_name == 'schedule' || 
+      github.event.inputs.run_scrapers != false
+    
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
     
     steps:
       - name: Checkout repository
@@ -101,6 +115,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+      
+      - name: Verify Supabase credentials
+        run: |
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_KEY" ]; then
+            echo "ERROR: SUPABASE_URL or SUPABASE_KEY not set!"
+            exit 1
+          else
+            echo "[OK] Supabase credentials are set"
+            echo "  URL: ${SUPABASE_URL:0:30}..."
+            echo "  Key: ${SUPABASE_KEY:0:20}..."
+          fi
       
       - name: Run News Scraper
         run: |
@@ -131,6 +156,10 @@ jobs:
       (github.event.inputs.run_processor != false) &&
       (needs.scrape-youtube.result == 'success' || needs.scrape-news.result == 'success')
     
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -145,6 +174,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+      
+      - name: Verify Supabase credentials
+        run: |
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_KEY" ]; then
+            echo "ERROR: SUPABASE_URL or SUPABASE_KEY not set!"
+            exit 1
+          else
+            echo "[OK] Supabase credentials are set"
+            echo "  URL: ${SUPABASE_URL:0:30}..."
+            echo "  Key: ${SUPABASE_KEY:0:20}..."
+          fi
       
       - name: Download ML Model (cached)
         run: |
@@ -184,6 +224,10 @@ jobs:
     needs: [process-sentiment]
     if: always() && needs.process-sentiment.result == 'success'
     
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -198,6 +242,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+      
+      - name: Verify Supabase credentials
+        run: |
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_KEY" ]; then
+            echo "ERROR: SUPABASE_URL or SUPABASE_KEY not set!"
+            exit 1
+          else
+            echo "[OK] Supabase credentials are set"
+            echo "  URL: ${SUPABASE_URL:0:30}..."
+            echo "  Key: ${SUPABASE_KEY:0:20}..."
+          fi
       
       - name: Generate Summary Report
         run: |

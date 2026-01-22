@@ -40,6 +40,20 @@ class DataSystem:
                 "Supabase client not available. "
                 "Ensure SUPABASE_URL and SUPABASE_KEY are set in .env"
             )
+        
+        # Verify bucket exists (non-blocking check)
+        try:
+            storage_client = self.client.storage.from_(self.bucket_name)
+            # Try to list bucket (will fail if bucket doesn't exist)
+            storage_client.list(limit=1)
+                print(f"Storage bucket '{bucket_name}' verified")
+        except Exception as e:
+            error_msg = str(e).lower()
+            if 'bucket' in error_msg and ('not found' in error_msg or 'does not exist' in error_msg):
+                print(f"WARNING: Storage bucket '{bucket_name}' does not exist!")
+                print(f"  Create it in Supabase Dashboard: Storage → New bucket → '{bucket_name}'")
+                print(f"  Or it will be created automatically on first upload")
+            # Don't fail initialization - let upload attempt handle it
     
     def save_raw_json(
         self,
@@ -66,23 +80,48 @@ class DataSystem:
         try:
             # Serialize data to JSON bytes
             json_content = json.dumps(data, indent=2, ensure_ascii=False).encode('utf-8')
+            print(f"  Preparing to upload {len(json_content)} bytes to storage...")
             
             # Upload to Supabase Storage
             file_path = f"{filename}"
             
             storage_client = self.client.storage.from_(self.bucket_name)
             
+            # Step 1: Upload to Storage (Data Lake)
             try:
-                storage_client.upload(file_path, json_content)
+                print(f"  Uploading to storage bucket '{self.bucket_name}' at path '{file_path}'...")
+                # Supabase storage upload: path, file_bytes, file_options (optional)
+                storage_client.upload(file_path, json_content, file_options={"content-type": "application/json", "upsert": "true"})
+                print(f"  [OK] Storage upload successful")
             except Exception as storage_err:
                 storage_msg = str(storage_err)
                 error_lower = storage_msg.lower()
                 
-                if 'trailing slash' in error_lower:
-                    pass
+                # Try without file_options if that fails
+                if 'file_options' in error_lower or 'unexpected keyword' in error_lower:
+                    print(f"  Warning: file_options not supported, trying basic upload...")
+                    try:
+                        storage_client.upload(file_path, json_content)
+                        print(f"  [OK] Storage upload successful (basic upload)")
+                    except Exception as basic_err:
+                        print(f"  [FAIL] Storage upload failed: {str(basic_err)[:200]}")
+                        return None
+                elif 'trailing slash' in error_lower:
+                    # Try again without trailing slash issue
+                    print(f"  Warning: Trailing slash issue, retrying...")
+                    try:
+                        storage_client.upload(file_path, json_content)
+                        print(f"  [OK] Storage upload successful (retry)")
+                    except Exception as retry_err:
+                        print(f"  [FAIL] Storage upload failed (retry): {str(retry_err)[:200]}")
+                        return None
+                elif 'bucket' in error_lower and ('not found' in error_lower or 'does not exist' in error_lower):
+                    print(f"  [FAIL] Storage Error: Bucket '{self.bucket_name}' does not exist!")
+                    print(f"  Create the bucket in Supabase Dashboard: Storage → New bucket → '{self.bucket_name}'")
+                    return None
                 elif 'row-level security' in error_lower or 'violates row-level security policy' in error_lower:
-                    print(f"Storage RLS Error: Bucket '{self.bucket_name}' needs storage policies")
-                    print("Run this SQL in Supabase SQL Editor:")
+                    print(f"  [FAIL] Storage RLS Error: Bucket '{self.bucket_name}' needs storage policies")
+                    print("  Run this SQL in Supabase SQL Editor:")
                     print(f"""
 CREATE POLICY "Allow public uploads to {self.bucket_name}"
 ON storage.objects FOR INSERT
@@ -96,9 +135,10 @@ USING (bucket_id = '{self.bucket_name}');
 """)
                     return None
                 else:
-                    print(f"Storage error: {storage_msg}")
+                    print(f"  [FAIL] Storage upload failed: {storage_msg[:200]}")
                     return None
             
+            # Step 2: Create job queue entry
             metadata = video_metadata or {}
             metadata.update({
                 'filename': filename,
@@ -107,6 +147,7 @@ USING (bucket_id = '{self.bucket_name}');
             })
             
             try:
+                print(f"  Creating job queue entry...")
                 result = self.client.table('job_queue').insert({
                     'status': 'PENDING',
                     'file_path': file_path,
@@ -115,20 +156,31 @@ USING (bucket_id = '{self.bucket_name}');
                 
                 if result.data and len(result.data) > 0:
                     job_id = result.data[0]['id']
-                    print(f"Data saved to {file_path}, job {job_id} created")
+                    print(f"  [OK] Job queue entry created: {job_id}")
+                    print(f"  [OK] Complete: Data saved to {file_path}, job {job_id} queued")
                     return job_id
                 else:
-                    print("Warning: Job created but no ID returned")
+                    print(f"  [WARN] Warning: Job insert returned no data")
+                    print(f"  File uploaded to storage but job queue entry failed!")
+                    print(f"  Check if job_queue table exists and has correct schema")
                     return None
             except Exception as db_err:
                 error_msg = str(db_err)
                 error_lower = error_msg.lower()
                 
-                if 'row-level security' in error_lower or 'violates row-level security policy' in error_lower:
-                    print(f"Database RLS Error: {error_msg}")
-                    print("Run: ALTER TABLE job_queue DISABLE ROW LEVEL SECURITY;")
+                print(f"  [FAIL] Job queue creation failed!")
+                
+                if 'relation' in error_lower and 'does not exist' in error_lower:
+                    print(f"  ERROR: job_queue table does not exist!")
+                    print(f"  Run schema.sql in Supabase SQL Editor to create the table")
+                elif 'row-level security' in error_lower or 'violates row-level security policy' in error_lower:
+                    print(f"  ERROR: Row Level Security blocking job_queue insert")
+                    print(f"  Run: ALTER TABLE job_queue DISABLE ROW LEVEL SECURITY;")
                 else:
-                    print(f"Database error: {error_msg}")
+                    print(f"  ERROR: {error_msg[:200]}")
+                
+                print(f"  WARNING: File was uploaded to storage but job was NOT queued!")
+                print(f"  File path: {file_path}")
                 return None
                 
         except Exception as e:
@@ -167,4 +219,47 @@ USING (bucket_id = '{self.bucket_name}');
             }).eq('id', job_id).execute()
         except Exception as e:
             print(f"Error updating job status: {str(e)}")
+    
+    def verify_setup(self) -> bool:
+        """
+        Verify that storage bucket and job_queue table are accessible.
+        
+        Returns:
+            True if setup is correct, False otherwise
+        """
+        issues = []
+        
+        # Check storage bucket
+        try:
+            storage_client = self.client.storage.from_(self.bucket_name)
+            storage_client.list(limit=1)
+            print(f"[OK] Storage bucket '{self.bucket_name}' is accessible")
+        except Exception as e:
+            error_msg = str(e).lower()
+            if 'bucket' in error_msg and ('not found' in error_msg or 'does not exist' in error_msg):
+                issues.append(f"Storage bucket '{self.bucket_name}' does not exist")
+            else:
+                issues.append(f"Storage bucket access error: {str(e)[:100]}")
+        
+        # Check job_queue table
+        try:
+            result = self.client.table('job_queue').select('id', count='exact').limit(1).execute()
+            print(f"[OK] job_queue table is accessible")
+        except Exception as e:
+            error_msg = str(e).lower()
+            if 'relation' in error_msg and 'does not exist' in error_msg:
+                issues.append("job_queue table does not exist - run schema.sql")
+            elif 'row-level security' in error_msg:
+                issues.append("job_queue table has RLS enabled - disable it or add policies")
+            else:
+                issues.append(f"job_queue table access error: {str(e)[:100]}")
+        
+        if issues:
+            print(f"\n[WARN] Setup Issues Found:")
+            for issue in issues:
+                print(f"  - {issue}")
+            return False
+        
+        print(f"[OK] All systems verified")
+        return True
 

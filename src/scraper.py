@@ -159,6 +159,10 @@ def scrape_comments(video_list: Optional[List[Dict]] = None):
     # Initialize DataSystem for Supabase operations
     try:
         data_system = DataSystem(bucket_name='raw_data')
+        print("\nVerifying Supabase setup...")
+        if not data_system.verify_setup():
+            print("\n[WARN] WARNING: Setup verification failed. Jobs may not be created.")
+            print("Fix the issues above before continuing.\n")
     except RuntimeError as e:
         print(f"Error initializing DataSystem: {e}")
         print("Cannot proceed without Supabase connection.")
@@ -169,6 +173,9 @@ def scrape_comments(video_list: Optional[List[Dict]] = None):
     print(f"Total videos to process: {len(video_list)}")
     print("=" * 60)
     print()
+    
+    jobs_created = 0
+    videos_skipped = 0
     
     for i, video in enumerate(video_list, 1):
         video_url = video.get('url', '')
@@ -194,7 +201,8 @@ def scrape_comments(video_list: Optional[List[Dict]] = None):
             comments, description = scrape_comments_from_video(video_url, MAX_COMMENTS_PER_VIDEO)
             
             if not comments:
-                print(f"    No comments extracted")
+                print(f"    No comments extracted - skipping job creation")
+                videos_skipped += 1
                 continue
             
             # Structure the data with Weighted Hybrid model
@@ -239,10 +247,12 @@ def scrape_comments(video_list: Optional[List[Dict]] = None):
             )
             
             if job_id:
+                jobs_created += 1
                 print(f"  Extracted {len(comments)} user comments" + (f" and transcript ({len(transcript_text)} chars)" if transcript_text else " (no transcript)"))
                 print(f"  Job {job_id} created in queue")
             else:
-                print(f"  Extracted {len(comments)} user comments" + (f" and transcript" if transcript_text else "") + " (failed to save)")
+                videos_skipped += 1
+                print(f"  Extracted {len(comments)} user comments" + (f" and transcript" if transcript_text else "") + " (FAILED to save - check logs above)")
         
         except Exception as e:
             print(f"  Error processing video: {str(e)[:100]}")
@@ -255,6 +265,33 @@ def scrape_comments(video_list: Optional[List[Dict]] = None):
     print()
     print("=" * 60)
     print("Scraping Complete!")
+    print("=" * 60)
+    print(f"Summary:")
+    print(f"  Videos processed: {len(video_list)}")
+    print(f"  Jobs created: {jobs_created}")
+    print(f"  Videos skipped: {videos_skipped} (no comments or save failed)")
+    
+    # Verify jobs were actually created in database
+    if jobs_created > 0:
+        try:
+            from infra.client import get_supabase_client
+            client = get_supabase_client()
+            if client:
+                result = client.table('job_queue').select('id', count='exact').eq('status', 'PENDING').execute()
+                pending_count = result.count or 0
+                print(f"\nVerification:")
+                print(f"  PENDING jobs in queue: {pending_count}")
+                if pending_count < jobs_created:
+                    print(f"  [WARN] Expected {jobs_created} jobs but found {pending_count} in queue")
+        except Exception as e:
+            print(f"  [WARN] Could not verify jobs in database: {str(e)[:100]}")
+    
+    if jobs_created == 0:
+        print(f"\n[WARN] WARNING: No jobs were created!")
+        print(f"  - Check if videos have comments")
+        print(f"  - Check Supabase connection and storage permissions")
+        print(f"  - Check job_queue table exists (run schema.sql)")
+        print(f"  - Check storage bucket 'raw_data' exists")
     print("=" * 60)
 
 

@@ -1142,7 +1142,7 @@ def process_job(job_id: str, data_system: DataSystem, model) -> bool:
         
         # Check for duplicate (semantic deduplication)
         if is_duplicate_content(client, content_id, alliance_name):
-            print(f"  ⚠ Duplicate content detected ({content_id}), skipping")
+            print(f"  [WARN] Duplicate content detected ({content_id}), skipping")
             data_system.update_job_status(job_id, 'DONE')
             log_metric(client, 'duplicate_skipped', 1, {'content_type': content_type})
             return True
