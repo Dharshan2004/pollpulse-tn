@@ -34,6 +34,7 @@ jobs:
   scrape-youtube:
     name: Scrape YouTube Content
     runs-on: ubuntu-latest
+    environment: supabase
     if: |
       github.event_name == 'schedule' || 
       github.event.inputs.run_scrapers != false
@@ -71,10 +72,11 @@ jobs:
             echo ""
             echo "To fix this:"
             echo "1. Go to your repository Settings → Secrets and variables → Actions"
-            echo "2. Add repository secrets named:"
-            echo "   - SUPABASE_URL (your Supabase project URL)"
-            echo "   - SUPABASE_KEY (your Supabase anon/service role key)"
-            echo "3. Re-run this workflow"
+            echo "2. Add secrets named SUPABASE_URL and SUPABASE_KEY:"
+            echo "   Option A: Repository secrets (available to all workflows)"
+            echo "   Option B: Environment secrets under 'supabase' environment"
+            echo "3. Make sure the workflow references 'environment: supabase' if using environment secrets"
+            echo "4. Re-run this workflow"
             exit 1
           else
             echo "[OK] Supabase credentials are set"
@@ -107,6 +109,7 @@ jobs:
   scrape-news:
     name: Scrape News Headlines
     runs-on: ubuntu-latest
+    environment: supabase
     if: |
       github.event_name == 'schedule' || 
       github.event.inputs.run_scrapers != false
@@ -144,10 +147,11 @@ jobs:
             echo ""
             echo "To fix this:"
             echo "1. Go to your repository Settings → Secrets and variables → Actions"
-            echo "2. Add repository secrets named:"
-            echo "   - SUPABASE_URL (your Supabase project URL)"
-            echo "   - SUPABASE_KEY (your Supabase anon/service role key)"
-            echo "3. Re-run this workflow"
+            echo "2. Add secrets named SUPABASE_URL and SUPABASE_KEY:"
+            echo "   Option A: Repository secrets (available to all workflows)"
+            echo "   Option B: Environment secrets under 'supabase' environment"
+            echo "3. Make sure the workflow references 'environment: supabase' if using environment secrets"
+            echo "4. Re-run this workflow"
             exit 1
           else
             echo "[OK] Supabase credentials are set"
@@ -178,6 +182,7 @@ jobs:
   process-sentiment:
     name: Process Sentiment Analysis
     runs-on: ubuntu-latest
+    environment: supabase
     needs: [scrape-youtube, scrape-news]
     if: |
       always() && 
@@ -217,10 +222,11 @@ jobs:
             echo ""
             echo "To fix this:"
             echo "1. Go to your repository Settings → Secrets and variables → Actions"
-            echo "2. Add repository secrets named:"
-            echo "   - SUPABASE_URL (your Supabase project URL)"
-            echo "   - SUPABASE_KEY (your Supabase anon/service role key)"
-            echo "3. Re-run this workflow"
+            echo "2. Add secrets named SUPABASE_URL and SUPABASE_KEY:"
+            echo "   Option A: Repository secrets (available to all workflows)"
+            echo "   Option B: Environment secrets under 'supabase' environment"
+            echo "3. Make sure the workflow references 'environment: supabase' if using environment secrets"
+            echo "4. Re-run this workflow"
             exit 1
           else
             echo "[OK] Supabase credentials are set"
@@ -263,6 +269,7 @@ jobs:
   generate-report:
     name: Generate Daily Report
     runs-on: ubuntu-latest
+    environment: supabase
     needs: [process-sentiment]
     if: always() && needs.process-sentiment.result == 'success'
     
@@ -299,10 +306,11 @@ jobs:
             echo ""
             echo "To fix this:"
             echo "1. Go to your repository Settings → Secrets and variables → Actions"
-            echo "2. Add repository secrets named:"
-            echo "   - SUPABASE_URL (your Supabase project URL)"
-            echo "   - SUPABASE_KEY (your Supabase anon/service role key)"
-            echo "3. Re-run this workflow"
+            echo "2. Add secrets named SUPABASE_URL and SUPABASE_KEY:"
+            echo "   Option A: Repository secrets (available to all workflows)"
+            echo "   Option B: Environment secrets under 'supabase' environment"
+            echo "3. Make sure the workflow references 'environment: supabase' if using environment secrets"
+            echo "4. Re-run this workflow"
             exit 1
           else
             echo "[OK] Supabase credentials are set"
