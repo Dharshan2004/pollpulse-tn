@@ -58,9 +58,23 @@ jobs:
           pip install -r requirements.txt
       
       - name: Verify Supabase credentials
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
+          echo "Checking Supabase credentials..."
+          echo "SUPABASE_URL length: ${#SUPABASE_URL}"
+          echo "SUPABASE_KEY length: ${#SUPABASE_KEY}"
+          
           if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_KEY" ]; then
             echo "ERROR: SUPABASE_URL or SUPABASE_KEY not set!"
+            echo ""
+            echo "To fix this:"
+            echo "1. Go to your repository Settings → Secrets and variables → Actions"
+            echo "2. Add repository secrets named:"
+            echo "   - SUPABASE_URL (your Supabase project URL)"
+            echo "   - SUPABASE_KEY (your Supabase anon/service role key)"
+            echo "3. Re-run this workflow"
             exit 1
           else
             echo "[OK] Supabase credentials are set"
@@ -117,9 +131,23 @@ jobs:
           pip install -r requirements.txt
       
       - name: Verify Supabase credentials
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
+          echo "Checking Supabase credentials..."
+          echo "SUPABASE_URL length: ${#SUPABASE_URL}"
+          echo "SUPABASE_KEY length: ${#SUPABASE_KEY}"
+          
           if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_KEY" ]; then
             echo "ERROR: SUPABASE_URL or SUPABASE_KEY not set!"
+            echo ""
+            echo "To fix this:"
+            echo "1. Go to your repository Settings → Secrets and variables → Actions"
+            echo "2. Add repository secrets named:"
+            echo "   - SUPABASE_URL (your Supabase project URL)"
+            echo "   - SUPABASE_KEY (your Supabase anon/service role key)"
+            echo "3. Re-run this workflow"
             exit 1
           else
             echo "[OK] Supabase credentials are set"
@@ -176,9 +204,23 @@ jobs:
           pip install -r requirements.txt
       
       - name: Verify Supabase credentials
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
+          echo "Checking Supabase credentials..."
+          echo "SUPABASE_URL length: ${#SUPABASE_URL}"
+          echo "SUPABASE_KEY length: ${#SUPABASE_KEY}"
+          
           if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_KEY" ]; then
             echo "ERROR: SUPABASE_URL or SUPABASE_KEY not set!"
+            echo ""
+            echo "To fix this:"
+            echo "1. Go to your repository Settings → Secrets and variables → Actions"
+            echo "2. Add repository secrets named:"
+            echo "   - SUPABASE_URL (your Supabase project URL)"
+            echo "   - SUPABASE_KEY (your Supabase anon/service role key)"
+            echo "3. Re-run this workflow"
             exit 1
           else
             echo "[OK] Supabase credentials are set"
@@ -244,9 +286,23 @@ jobs:
           pip install -r requirements.txt
       
       - name: Verify Supabase credentials
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
+          echo "Checking Supabase credentials..."
+          echo "SUPABASE_URL length: ${#SUPABASE_URL}"
+          echo "SUPABASE_KEY length: ${#SUPABASE_KEY}"
+          
           if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_KEY" ]; then
             echo "ERROR: SUPABASE_URL or SUPABASE_KEY not set!"
+            echo ""
+            echo "To fix this:"
+            echo "1. Go to your repository Settings → Secrets and variables → Actions"
+            echo "2. Add repository secrets named:"
+            echo "   - SUPABASE_URL (your Supabase project URL)"
+            echo "   - SUPABASE_KEY (your Supabase anon/service role key)"
+            echo "3. Re-run this workflow"
             exit 1
           else
             echo "[OK] Supabase credentials are set"
