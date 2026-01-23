@@ -19,13 +19,15 @@ import os
 import time
 import hashlib
 import traceback
-import math 
+import math
+import re
 from datetime import datetime, timezone
 from typing import Optional, Dict, List, Any
 from transformers import pipeline, AutoModelForSequenceClassification, XLMRobertaTokenizer
 
 from infra.client import get_supabase_client
 from infra.data_manager import DataSystem
+from utils.classifier import classify_alliance
 
 
 # Configuration
@@ -425,9 +427,7 @@ def detect_alliance(data: Dict) -> str:
     """
     Detect which political alliance the content belongs to.
     
-    Priority:
-    1. Use meta['alliance'] if provided by producer (unless it's "keywords" - a known bug)
-    2. Keyword match against title/description
+    Uses shared classification utility for consistency across pipeline.
     
     Args:
         data: Full JSON payload
@@ -435,34 +435,12 @@ def detect_alliance(data: Dict) -> str:
     Returns:
         Alliance name (e.g., "DMK_Front") or "Unknown"
     """
-    # Load alliances config first to get valid alliance names
-    alliances = load_alliances()
-    keywords_map = alliances.get('keywords', {})
-    valid_alliances = set(keywords_map.keys())
-    
-    # Priority 1: Check if alliance is already set by producer
+    # Check if alliance is already set by producer
     meta = data.get('meta', {})
     producer_alliance = meta.get('alliance', '')
     
-    # Only use producer alliance if it's valid (not empty, not "Unknown", not "keywords")
-    if producer_alliance and producer_alliance != 'Unknown' and producer_alliance in valid_alliances:
-        return producer_alliance
-    
-    # If producer set "keywords" (bug from old discover.py), log warning and re-detect
-    if producer_alliance == 'keywords':
-        print(f"  Warning: Producer set alliance='keywords' (bug). Re-detecting from content...")
-    
-    # Priority 2: Keyword match against title/description
-    title = (meta.get('title', '') or '').lower()
-    description = (meta.get('description', '') or '').lower()
-    text_to_search = f"{title} {description}"
-    
-    for alliance_name, keywords in keywords_map.items():
-        for keyword in keywords:
-            if keyword.lower() in text_to_search:
-                return alliance_name
-    
-    return "Unknown"
+    # Use shared classifier (will use producer_alliance if valid)
+    return classify_alliance(data, producer_alliance=producer_alliance if producer_alliance else None)
 
 
 def get_all_constituencies() -> List[str]:
@@ -664,8 +642,12 @@ def persist_predictions(
     Returns:
         Number of constituencies updated
     """
+    # Handle "Unknown" alliance
+    # For news articles: Skip if truly neutral (no political content detected)
+    # For YouTube: Skip (should have alliance from discovery phase)
     if alliance_name == "Unknown":
-        print("  Skipping persistence: Unknown alliance")
+        print("  Skipping persistence: Unknown alliance (no political content detected)")
+        print("  Note: Generic news articles without alliance-specific content are excluded")
         return 0
     
     updated_count = 0
@@ -1140,6 +1122,18 @@ def process_job(job_id: str, data_system: DataSystem, model) -> bool:
         content_type = get_content_type(data)
         alliance_name = detect_alliance(data)
         
+        # Debug logging for alliance detection
+        if alliance_name == "Unknown":
+            meta = data.get('meta', {})
+            title = meta.get('title', '')[:100] if meta.get('title') else ''
+            headlines = data.get('authoritative_content', [])
+            print(f"  Alliance detection: Unknown")
+            print(f"    Title: {title}")
+            if headlines:
+                print(f"    Headlines sample: {str(headlines[:2])[:150]}")
+        else:
+            print(f"  Alliance detected: {alliance_name}")
+        
         # Check for duplicate (semantic deduplication)
         if is_duplicate_content(client, content_id, alliance_name):
             print(f"  [WARN] Duplicate content detected ({content_id}), skipping")
@@ -1310,12 +1304,13 @@ def process_job(job_id: str, data_system: DataSystem, model) -> bool:
         return False
 
 
-def poll_and_process(poll_interval: int = 5):
+def poll_and_process(poll_interval: int = 5, timeout_minutes: int = 3):
     """
     Main consumer loop that polls the job queue and processes jobs.
     
     Args:
         poll_interval: Seconds to wait between polls when no jobs are found
+        timeout_minutes: Exit if no jobs found for this many minutes (default: 3)
     """
     print("=" * 60)
     print("Starting Sentiment Analysis Processor (Consumer)")
@@ -1340,7 +1335,8 @@ def poll_and_process(poll_interval: int = 5):
         return
     
     print("Model loaded successfully")
-    print("Polling job queue for PENDING jobs...")
+    print(f"Polling job queue for PENDING jobs...")
+    print(f"Timeout: Will exit if no jobs found for {timeout_minutes} minutes")
     print()
     
     client = get_supabase_client()
@@ -1348,18 +1344,34 @@ def poll_and_process(poll_interval: int = 5):
         print("Error: Supabase client not available")
         return
     
+    # Track last job time for timeout
+    last_job_time = time.time()
+    timeout_seconds = timeout_minutes * 60
+    
     # Main polling loop
     while True:
         try:
+            # Check if timeout exceeded
+            time_since_last_job = time.time() - last_job_time
+            if time_since_last_job >= timeout_seconds:
+                print(f"\n{'=' * 60}")
+                print(f"Timeout: No jobs found for {timeout_minutes} minutes")
+                print(f"Exiting processor gracefully...")
+                print(f"{'=' * 60}")
+                break
+            
             # Query for PENDING jobs
             result = client.table('job_queue').select('id').eq('status', 'PENDING').limit(1).execute()
             
             if result.data and len(result.data) > 0:
                 job_id = result.data[0]['id']
                 process_job(job_id, data_system, model)
+                last_job_time = time.time()  # Reset timeout timer
                 print()
             else:
-                print(f"No pending jobs found. Waiting {poll_interval} seconds...")
+                time_remaining = timeout_seconds - time_since_last_job
+                minutes_remaining = int(time_remaining / 60)
+                print(f"No pending jobs found. Waiting {poll_interval} seconds... (Timeout in {minutes_remaining}m)")
                 time.sleep(poll_interval)
         
         except KeyboardInterrupt:
@@ -1371,5 +1383,8 @@ def poll_and_process(poll_interval: int = 5):
 
 
 if __name__ == "__main__":
-    poll_and_process(poll_interval=5)
+    # Allow timeout to be configured via environment variable
+    timeout_minutes = int(os.getenv('PROCESSOR_TIMEOUT_MINUTES', '3'))
+    poll_interval = int(os.getenv('PROCESSOR_POLL_INTERVAL', '5'))
+    poll_and_process(poll_interval=poll_interval, timeout_minutes=timeout_minutes)
 

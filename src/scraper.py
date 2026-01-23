@@ -26,6 +26,43 @@ from dotenv import load_dotenv
 
 from infra.data_manager import DataSystem
 from discover import discover_videos
+from utils.classifier import classify_alliance, should_process_content
+
+# Load environment variables
+load_dotenv()
+
+def get_ytdlp_opts_with_cookies(base_opts: dict) -> dict:
+    """
+    Add cookie support to yt-dlp options if cookies file exists.
+    
+    Checks for cookies in this order:
+    1. YOUTUBE_COOKIES_PATH environment variable
+    2. cookies.txt in project root
+    3. cookies.txt in current directory
+    
+    Args:
+        base_opts: Base yt-dlp options dictionary
+    
+    Returns:
+        Updated options dictionary with cookies if available
+    """
+    cookies_paths = [
+        os.getenv('YOUTUBE_COOKIES_PATH'),
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), 'cookies.txt'),
+        'cookies.txt',
+    ]
+    
+    for cookies_path in cookies_paths:
+        if cookies_path and os.path.exists(cookies_path):
+            print(f"  Using cookies from: {cookies_path}")
+            base_opts['cookiefile'] = cookies_path
+            return base_opts
+    
+    # No cookies found - warn but continue
+    print("  WARNING: No cookies file found. YouTube may block requests.")
+    print("  To fix: Export cookies from your browser and save as 'cookies.txt'")
+    print("  See: https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp")
+    return base_opts
 
 # Load environment variables
 load_dotenv()
@@ -111,6 +148,9 @@ def scrape_comments_from_video(video_url: str, max_comments: int = 50) -> tuple:
             'writeautomaticsub': False,
             'getcomments': True,
         }
+        
+        # Add cookies if available
+        ydl_opts = get_ytdlp_opts_with_cookies(ydl_opts)
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=False)
@@ -213,7 +253,7 @@ def scrape_comments(video_list: Optional[List[Dict]] = None):
                     "title": video_title,
                     "description": description,
                     "url": video_url,
-                    "alliance": video.get('alliance', 'Unknown'),
+                    "alliance": video.get('alliance', 'Unknown'),  # Initial alliance from discovery
                     "search_query": video.get('search_query', ''),
                     "channel": video.get('channel', 'Unknown'),
                     "scraped_at": datetime.now().isoformat()
@@ -222,6 +262,19 @@ def scrape_comments(video_list: Optional[List[Dict]] = None):
                 "authoritative_content": [],  # Empty for YouTube sources (noisy signal)
                 "user_comments": comments  # Low weight (1.0) - user sentiment
             }
+            
+            # Classify alliance with full content (more accurate than discovery phase)
+            detected_alliance = classify_alliance(structured_data, producer_alliance=video.get('alliance'))
+            
+            # Skip if no alliance detected (saves storage and processing)
+            if detected_alliance == "Unknown":
+                print(f"    Skipping: No political alliance detected in content")
+                videos_skipped += 1
+                continue
+            
+            # Update alliance in structured data with detected alliance
+            structured_data["meta"]["alliance"] = detected_alliance
+            print(f"    Alliance detected: {detected_alliance}")
             
             # Prepare metadata for job queue
             video_metadata = {

@@ -17,6 +17,40 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def get_ytdlp_opts_with_cookies(base_opts: dict) -> dict:
+    """
+    Add cookie support to yt-dlp options if cookies file exists.
+    
+    Checks for cookies in this order:
+    1. YOUTUBE_COOKIES_PATH environment variable
+    2. cookies.txt in project root
+    3. cookies.txt in current directory
+    
+    Args:
+        base_opts: Base yt-dlp options dictionary
+    
+    Returns:
+        Updated options dictionary with cookies if available
+    """
+    cookies_paths = [
+        os.getenv('YOUTUBE_COOKIES_PATH'),
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), 'cookies.txt'),
+        'cookies.txt',
+    ]
+    
+    for cookies_path in cookies_paths:
+        if cookies_path and os.path.exists(cookies_path):
+            print(f"  Using cookies from: {cookies_path}")
+            base_opts['cookiefile'] = cookies_path
+            return base_opts
+    
+    # No cookies found - warn but continue
+    print("  WARNING: No cookies file found. YouTube may block requests.")
+    print("  To fix: Export cookies from your browser and save as 'cookies.txt'")
+    print("  See: https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp")
+    return base_opts
+
+
 CONFIG_PATH = os.path.join("config", "alliances.json")
 
 
@@ -64,6 +98,9 @@ def search_youtube_videos(query: str, max_results: int = 5) -> List[Dict]:
             'default_search': 'ytsearch',
             'max_downloads': max_results,
         }
+        
+        # Add cookies if available
+        ydl_opts = get_ytdlp_opts_with_cookies(ydl_opts)
         
         search_query = f"ytsearch{max_results}:{query}"
         

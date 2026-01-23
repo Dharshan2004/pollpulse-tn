@@ -242,12 +242,14 @@ jobs:
       - name: Run Sentiment Processor
         run: |
           echo "Processing sentiment analysis..."
-          # Run processor for a limited time (process available jobs)
-          timeout 1800 python src/processor.py || true
+          # Processor will exit gracefully after 3 minutes of no jobs
+          python src/processor.py
         timeout-minutes: 35
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          PROCESSOR_TIMEOUT_MINUTES: '3'
+          PROCESSOR_POLL_INTERVAL: '5'
           ENABLE_DEDUPLICATION: 'true'
           ENABLE_DLQ: 'true'
           ENABLE_METRICS: 'true'
