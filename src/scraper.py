@@ -58,10 +58,11 @@ def get_ytdlp_opts_with_cookies(base_opts: dict) -> dict:
             base_opts['cookiefile'] = cookies_path
             return base_opts
     
-    # No cookies found - warn but continue
-    print("  WARNING: No cookies file found. YouTube may block requests.")
-    print("  To fix: Export cookies from your browser and save as 'cookies.txt'")
-    print("  See: https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp")
+    # No cookies found - warn but continue (only in non-CI environments)
+    if not os.getenv('CI'):
+        print("  WARNING: No cookies file found. YouTube may block requests.")
+        print("  To fix: Export cookies from your browser and save as 'cookies.txt'")
+        print("  See: https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp")
     return base_opts
 
 # Load environment variables

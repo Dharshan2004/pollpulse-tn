@@ -35,7 +35,7 @@ except ImportError:
     TRANSFORMERS_AVAILABLE = False
     print("Warning: transformers not available. Using keyword-based classification.")
 
-CONFIG_DIR = Path(__file__).parent.parent / "config"
+CONFIG_DIR = Path(__file__).parent.parent.parent / "config"
 
 # Global model cache
 _zero_shot_classifier = None

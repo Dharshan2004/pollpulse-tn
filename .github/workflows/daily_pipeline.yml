@@ -84,15 +84,29 @@ jobs:
             echo "  Key: ${SUPABASE_KEY:0:20}..."
           fi
       
+      - name: Setup YouTube cookies (optional)
+        run: |
+          if [ -n "${{ secrets.YOUTUBE_COOKIES_BASE64 }}" ]; then
+            echo "${{ secrets.YOUTUBE_COOKIES_BASE64 }}" | base64 -d > cookies.txt
+            echo "[OK] Cookies file created from secret"
+            ls -lh cookies.txt
+          else
+            echo "No YOUTUBE_COOKIES_BASE64 secret found - YouTube scraping may fail without cookies"
+            echo "To add cookies: Export from browser, base64 encode, add as GitHub secret"
+          fi
+        continue-on-error: true
+      
       - name: Run YouTube Scraper
         run: |
           echo "Discovering and scraping YouTube videos..."
           echo "This will discover videos and scrape comments/transcripts..."
           python src/scraper.py
         env:
+          CI: 'true'
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           MAX_VIDEOS_PER_ALLIANCE: ${{ github.event.inputs.max_videos || '5' }}
+          YOUTUBE_COOKIES_PATH: cookies.txt
         timeout-minutes: 30
       
       - name: Upload scrape logs
