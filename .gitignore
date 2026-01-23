@@ -98,3 +98,61 @@ data/
 # OS files
 .DS_Store
 Thumbs.db
+
+# ============================================
+# Next.js / Node.js
+# ============================================
+
+# Dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Next.js build output
+.next/
+out/
+build/
+dist/
+
+# Next.js cache
+.next/cache/
+
+# Environment variables (frontend specific)
+frontend/.env
+frontend/.env.local
+frontend/.env.development.local
+frontend/.env.test.local
+frontend/.env.production.local
+
+# Vercel
+.vercel
+
+# TypeScript
+*.tsbuildinfo
+next-env.d.ts
+
+# Testing
+coverage/
+.nyc_output/
+
+# IDE - Next.js
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+logs/
+*.log
+
+# Package manager locks (optional - some teams commit these)
+# package-lock.json
+# yarn.lock
+# pnpm-lock.yaml
+
+# YouTube cookies (contains sensitive authentication data)
+cookies.txt
+*.cookies
